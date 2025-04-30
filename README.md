@@ -38,4 +38,4 @@ export NCCL_NET_PLUGIN=fuselink
 
 ## Note for OSDI Artifact
 
-We are currently working on additional experiments required by shepherd. Some codes are not stable and tailored for special environments of our testbeds.
+We are actively addressing the additional experiments requested by the Shepherd. Some of the codebase remain under active development and are currently optimized for the specialized configurations of our testing environments.
