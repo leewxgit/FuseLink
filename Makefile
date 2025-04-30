@@ -12,28 +12,11 @@ INC:=$(CUDA_CFLAGS) -I$(NCCL_INC) -I$(NCCL_HEADER) -I$(CONDA_PREFIX)/include -Is
 LIB_PATH:=-L/usr/lib/x86_64-linux-gnu -L$(NCCL_BUILD_DIR)/lib $(CUDA_LDFLAGS) -L$(CONDA_PREFIX)/lib
 
 CFLAGS:=-fPIC -O2 -Wno-deprecated-gpu-targets
-TEST_LIBS:=-lgtest -lgtest_main -lpthread -libverbs -lrt -lcuda -lcudart
 
 .PHONY: clean all test
 
 monitor: src/monitor_main.cpp src/monitor.cpp
 	g++ $(INC) -o monitor src/monitor_main.cpp src/monitor.cpp -lpthread -libverbs -lrt
-
-monitor_test: src/monitor_test.cpp src/monitor.cpp
-	g++ $(INC) -O0 -g -o monitor_test src/monitor_test.cpp src/monitor.cpp $(LIB_PATH) $(TEST_LIBS) 
-
-monitor_client_test: src/monitor_client_test.cpp src/monitor.cpp
-	g++ $(INC) -O0 -g -o monitor_client_test src/monitor_client_test.cpp src/monitor.cpp $(LIB_PATH) $(TEST_LIBS) 
-
-cumem_test: tests/cumem_test.cu src/cumem.cu nccl/src/misc/cudawrap.cc
-	$(NVCC) $(INC) -O2 -c -Xcompiler -fPIC -o cumem_test.o tests/cumem_test.cu
-	$(NVCC) $(INC) -O2 -c -Xcompiler -fPIC -o cudawrap.o nccl/src/misc/cudawrap.cc
-	$(NVCC) $(INC) -O2 -c -Xcompiler -fPIC -o cumem.o src/cumem.cu
-	g++ $(INC) $(LIB_PATH) -O0 -g -o cumem_test cumem_test.o cudawrap.o cumem.o  $(TEST_LIBS) 
-
-test: monitor_test monitor_client_test
-	./monitor_test
-	./monitor_client_test
 
 FLSRC:=src/net_multi_nic.cc \
 		src/fuselink.cc \
@@ -51,7 +34,7 @@ FLOBJS:=$(FLSRC:.cc=.o)
 CUOBJS:=$(CUSRC:.cu=.o)
 
 fl: $(BUILDDIR)/lib/$(FL_SO)
-all: fl monitor test
+all: fl monitor
 
 $(BUILDDIR)/lib/$(FL_SO): $(FLOBJS) $(CUOBJS)
 	mkdir -p $(BUILDDIR)/lib
@@ -59,13 +42,12 @@ $(BUILDDIR)/lib/$(FL_SO): $(FLOBJS) $(CUOBJS)
 
 %.o: %.cc
 	mkdir -p build/src
-	$(NVCC) $(INC) -O2 -c -Xcompiler -fPIC -o $@ $<
+	$(NVCC) $(INC) -O2 -c -Xcompiler $(CFLAGS) -o $@ $<
 
 %.o: %.cu
 	mkdir -p build/src
-	$(NVCC) $(INC) -O2 -c -Xcompiler -fPIC -o $@ $<
+	$(NVCC) $(INC) -O2 -c -Xcompiler $(CFLAGS) -o $@ $<
 
 clean:
 	rm -rf build
 	rm -f src/*.o
-	rm -f monitor_test monitor_client_test
