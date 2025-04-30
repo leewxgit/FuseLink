@@ -18,7 +18,7 @@ CFLAGS:=-fPIC -O2 -Wno-deprecated-gpu-targets
 monitor: src/monitor_main.cpp src/monitor.cpp
 	g++ $(INC) -o monitor src/monitor_main.cpp src/monitor.cpp -lpthread -libverbs -lrt
 
-FLSRC:=src/net_multi_nic.cc \
+FLSRC:=src/plugin.cc \
 		src/fuselink.cc \
         nccl/src/misc/ibvwrap.cc \
 		nccl/src/misc/socket.cc \
