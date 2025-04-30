@@ -27,6 +27,11 @@ make -j src.build CUDA_HOME=<your cuda home>
 CUDA_HOME=<your cuda home> NCCL_BUILD_DIR=./nccl/build make fl
 ```
 
+**Disable PCIe ACS to ensure fast NIC access**
+```bash
+bash scripts/disable_acs.sh
+```
+
 ## Usage
 
 Set `NCCL_NET_PLUGIN` environment to `fuselink` and expose `libnccl-net-fuselink.so` to `LD_LIBRARY_PATH`.
