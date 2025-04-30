@@ -1,6 +1,5 @@
 #ifndef FUSELINK_H
 #define FUSELINK_H
-// #include <infiniband/verbs.h>
 #include "ibvwrap.h"
 #include <vector>
 #include <map>
@@ -10,16 +9,49 @@
 
 extern ncclNet_t ncclNetPlugin_v7;
 
-// enum FuseLinkConnState {
-//   FuseLinkConnStateStart,
-//   FuseLinkConnStateConnect,
-//   FuseLinkConnStateAccept,
-//   FuseLinkConnStateSend,
-//   FuseLinkConnStateRecv,
-//   FuseLinkConnStateConnecting,
-//   FuseLinkConnStateConnected,
-//   FuseLinkConnStatePendingReady
-// };
+#define MAX_GPU_NUM 8
+
+#define FUSELINK_STEPS 8
+
+#define UPDATE_HACKING_THRESHOLD (FUSELINK_STEPS * sizeof(void*))
+
+struct ncclProxySubArgsForHacking {
+  void* connection;
+  int channelId;
+  int nsteps;
+  ssize_t nbytes;
+  int peer;
+
+  int groupSize; // Number of consecutive sub operations sharing the same recvComm
+  uint64_t base;
+  uint64_t posted;
+  uint64_t received;
+  uint64_t flushed;
+  uint64_t transmitted;
+  uint64_t done;
+  uint64_t end;
+  void* requests[FUSELINK_STEPS];
+  void* profilingEvents[FUSELINK_STEPS];
+  void* recvRequestsCache[FUSELINK_STEPS];
+  int recvRequestsSubCount;
+}; // use by nccl, import this to hack sub->posted, sub->received, sub->transmitted, sub->done from nccl
+
+struct FuseLinkMemRegion {
+  uint32_t sz; // 32bit is enough
+  struct ibv_mr *mr[MAX_GPU_NUM + 1][MAX_NIC_NUM]; // registration on all NICs, with cpu mem on MAX_GPU_NUM index
+  CUdeviceptr addr[MAX_GPU_NUM + 1]; // use this addr to enable RDMA access
+  CUmemGenericAllocationHandle hdl[MAX_GPU_NUM]; // physical memory
+  int nrefs; // when 0, can be freed
+  pthread_mutex_t lock; // update nrefs
+};
+
+struct FuseLinkMemHandle {
+  uintptr_t start_addr;
+  int dev; // mapped to which gpu, -1: cpumem
+  FuseLinkMemRegion *flmr;
+};
+
+typedef std::map<void*, FuseLinkMemHandle*> Addr2FuseLinkMemHandle;
 
 enum FuseLinkConnSetupState {
   FuseLinkConnSetupStateInit = 0,
@@ -199,19 +231,16 @@ public:
     // call monitorclient to get a new nic
     // convert txAvailable to mask
 
-    // DEBUG: return NULL to enforce the use of the comm itself
-    // randomly return a comm
-    int dev = 1;
-    printf("refreshRxComm: %d len: %d\n", dev, rx_recv_comms_.size());
+    // strategy for testing packet spraying in network
+    int dev = channelId % nNics;
     *fuselink_offset = dev;
     return rx_recv_comms_[dev];
-    // DEBUG: end
 
-    int group_id = channelId / NNIC_PER_GROUP;
-
-    dev = monitor_client_->getIdleNicRx(group_id, priority_dev_, txAvailable);
-    rxchannel2dev_[channelId] = dev;
-    return rx_recv_comms_[dev];
+    // int group_id = channelId / NNIC_PER_GROUP;
+    // int dev;
+    // dev = monitor_client_->getIdleNicRx(group_id, priority_dev_, txAvailable);
+    // rxchannel2dev_[channelId] = dev;
+    // return rx_recv_comms_[dev];
   }
 
 
@@ -284,6 +313,9 @@ private:
   std::map<int, int> rxchannel2dev_; // dev to comm.
 };
 
+void FuseLinkMemRegionInit(int nGPUs, void* base_addr, size_t size, int dev, FuseLinkMemRegion *flmr, bool is_cuda_mem);
+
+void FuseLinkMemRegionDestroy(FuseLinkMemRegion *flmr);
 
 #endif
 

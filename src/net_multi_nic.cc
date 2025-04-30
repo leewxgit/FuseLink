@@ -25,10 +25,14 @@
 
 #include "ibvwrap.h"
 
-#include "cumem.h"
+#include "cudawrap.h"
+
+// #include "cumem.h"
 #include "fuselink.h"
 
 FuseLinkConnManager* fuselink_conn_manager = nullptr;
+pthread_mutex_t addr2flmhdl_lock = PTHREAD_MUTEX_INITIALIZER;
+Addr2FuseLinkMemHandle addr2flmhdl;
 
 #define MAXNAMESIZE 64
 #define N_FINISHED_BATCH 8
@@ -58,6 +62,8 @@ struct ncclIbMrCache {
 };
 
 static int ncclNIbDevs = -1;
+static int NGPUs = -1;
+
 struct alignas(64) ncclIbDev {
   pthread_mutex_t lock;
   int device;
@@ -98,6 +104,8 @@ NCCL_PARAM(IbTc, "IB_TC", 0);
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
+NCCL_PARAM(BuffSize, "BUFFSIZE", -2);
+
 
 pthread_t ncclIbAsyncThread;
 static void* ncclIbAsyncThreadMain(void* args) {
@@ -108,7 +116,7 @@ static void* ncclIbAsyncThreadMain(void* args) {
     char *str;
     if (ncclSuccess != wrap_ibv_event_type_str(&str, event.event_type)) { break; }
     if (event.event_type != IBV_EVENT_COMM_EST)
-      WARN("NET/IB : Got async event : %s", str);
+      WARN("NET/FuseLink : Got async event : %s", str);
     if (ncclSuccess != wrap_ibv_ack_async_event(&event)) { break; }
   }
   return NULL;
@@ -178,15 +186,13 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
   static int shownIbHcaEnv = 0;
   if(wrap_ibv_symbols() != ncclSuccess) { return ncclInternalError; }
 
-  // cudaDeviceEnablePeerAccess(2, 0);
-
   if (ncclNIbDevs == -1) {
     pthread_mutex_lock(&ncclIbLock);
     wrap_ibv_fork_init();
     if (ncclNIbDevs == -1) {
       ncclNIbDevs = 0;
       if (ncclFindInterfaces(ncclIbIfName, &ncclIbIfAddr, MAX_IF_NAME_SIZE, 1) != 1) {
-        WARN("NET/IB : No IP interface found.");
+        WARN("NET/FuseLink : No IP interface found.");
         return ncclInternalError;
       }
 
@@ -209,21 +215,21 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
       for (int d=0; d<nIbDevs && ncclNIbDevs<MAX_IB_DEVS; d++) {
         struct ibv_context * context;
         if (ncclSuccess != wrap_ibv_open_device(&context, devices[d]) || context == NULL) {
-          WARN("NET/IB : Unable to open device %s", devices[d]->name);
+          WARN("NET/FuseLink : Unable to open device %s", devices[d]->name);
           continue;
         }
         int nPorts = 0;
         struct ibv_device_attr devAttr;
         memset(&devAttr, 0, sizeof(devAttr));
         if (ncclSuccess != wrap_ibv_query_device(context, &devAttr)) {
-          WARN("NET/IB : Unable to query device %s", devices[d]->name);
+          WARN("NET/FuseLink : Unable to query device %s", devices[d]->name);
           if (ncclSuccess != wrap_ibv_close_device(context)) { return ncclInternalError; }
           continue;
         }
         for (int port = 1; port <= devAttr.phys_port_cnt; port++) {
           struct ibv_port_attr portAttr;
           if (ncclSuccess != wrap_ibv_query_port(context, port, &portAttr)) {
-            WARN("NET/IB : Unable to query port %d", port);
+            WARN("NET/FuseLink : Unable to query port %d", port);
             continue;
           }
           if (portAttr.state != IBV_PORT_ACTIVE) continue;
@@ -234,7 +240,7 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
           if (! (matchIfList(devices[d]->name, port, userIfs, nUserIfs, searchExact) ^ searchNot)) {
             continue;
           }
-          TRACE(NCCL_INIT|NCCL_NET,"NET/IB: [%d] %s:%d/%s ", d, devices[d]->name, port,
+          TRACE(NCCL_INIT|NCCL_NET,"NET/FuseLink: [%d] %s:%d/%s ", d, devices[d]->name, port,
               portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND ? "IB" : "RoCE");
           pthread_mutex_init(&ncclIbDevs[ncclNIbDevs].lock, NULL);
           ncclIbDevs[ncclNIbDevs].device = d;
@@ -268,19 +274,18 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
       if (nIbDevs && (ncclSuccess != wrap_ibv_free_device_list(devices))) { return ncclInternalError; };
     }
     if (ncclNIbDevs == 0) {
-      INFO(NCCL_INIT|NCCL_NET, "NET/IB : No device found.");
+      INFO(NCCL_INIT|NCCL_NET, "NET/FuseLink : No device found.");
     } else {
       char line[1024];
       line[0] = '\0';
       // Determine whether RELAXED_ORDERING is enabled and possible
-      ncclIbRelaxedOrderingEnabled = ncclIbRelaxedOrderingCapable();
       for (int d=0; d<ncclNIbDevs; d++) {
         snprintf(line+strlen(line), 1023-strlen(line), " [%d]%s:%d/%s", d, ncclIbDevs[d].devName,
             ncclIbDevs[d].port, ncclIbDevs[d].link == IBV_LINK_LAYER_INFINIBAND ? "IB" : "RoCE");
       }
       line[1023] = '\0';
       char addrline[SOCKET_NAME_MAXLEN+1];
-      INFO(NCCL_INIT|NCCL_NET, "NET/IB : Using%s %s; OOB %s:%s", line, ncclIbRelaxedOrderingEnabled ? "[RO]" : "",
+      INFO(NCCL_INIT|NCCL_NET, "NET/FuseLink : Using%s %s; OOB %s:%s", line, ncclIbRelaxedOrderingEnabled ? "[RO]" : "",
            ncclIbIfName, ncclSocketToString(&ncclIbIfAddr, addrline));
     }
     pthread_mutex_unlock(&ncclIbLock);
@@ -291,6 +296,7 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
   fuselink_conn_manager->tx_setup_state_ = FuseLinkConnSetupStateInit;
   fuselink_conn_manager->rx_setup_state_ = FuseLinkConnSetupStateInit;
 
+  // allocate pd for each ib device
   for (int idev = 0; idev < ncclNIbDevs; idev++) {
     if (0 == ncclIbDevs[idev].pdRefs++) {
       ncclResult_t res;
@@ -302,6 +308,13 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
       }
     }
   }
+
+  char *warn_str = \
+   "\n\n=======================\nNET/FuseLink: init done\n\nFuseLink is in very early stage of development, use in caution.\n=======================";
+
+  WARN("%s", warn_str);
+
+  CUDACHECK(cudaGetDeviceCount(&NGPUs));
 
   return ncclSuccess;
 }
@@ -458,6 +471,12 @@ struct ncclIbRequest {
       int sizes[NCCL_NET_IB_MAX_RECVS];
     } recv;
   };
+  uint64_t* posted;
+  uint64_t* received;
+  uint64_t* flushed;
+  uint64_t* transmitted;
+  uint64_t* done;
+
 };
 
 struct ncclIbVerbs {
@@ -506,6 +525,15 @@ struct ncclIbSendComm {
   struct ncclIbGidInfo gidInfo;
   int channelId;
   int64_t n_finished; // number of finished requests
+
+  // int initialized;
+  uint64_t* posted;
+  uint64_t* received;
+  uint64_t* flushed;
+  uint64_t* transmitted;
+  uint64_t* done;
+
+  uintptr_t request_addr;
 };
 // The SendFifo needs to be 32-byte aligned and each element needs
 // to be a 32-byte multiple, so that an entry does not get split and
@@ -548,13 +576,27 @@ struct ncclIbRecvComm {
   uint32_t txAvailable; // a mask indicating tx nic availability.
   int64_t n_finished;
   int fuselink_offset;
+
+  // for hacking upper layer info
+  // int initialized;
+  uint64_t* posted;
+  uint64_t* received;
+  uint64_t* flushed;
+  uint64_t* transmitted;
+  uint64_t* done;
+  // done
+  uintptr_t request_addr;
 };
 static_assert((offsetof(struct ncclIbRecvComm, remFifo) % 32) == 0, "ncclIbSendComm fifo must be 32-byte aligned");
 
 NCCL_PARAM(IbQpsPerConn, "IB_QPS_PER_CONNECTION", 1);
 
+static uintptr_t get_addr_abs(uintptr_t l, uintptr_t r) {
+  return l > r ? l - r : r - l;
+}
+
 ncclResult_t ncclIbInitVerbs(int dev, struct ibv_context* ctx, struct ncclIbVerbs* verbs) {
-  INFO(NCCL_INIT|NCCL_NET, "NET/IB : Using device %d name %s", dev, ncclIbDevs[dev].devName);
+  INFO(NCCL_INIT|NCCL_NET, "NET/FuseLink : Using device %d name %s", dev, ncclIbDevs[dev].devName);
   verbs->dev = dev;
 
   pthread_mutex_lock(&ncclIbDevs[dev].lock);
@@ -672,7 +714,7 @@ ncclResult_t ncclIbListen(int dev, void* opaqueHandle, void** listenComm) {
   memset(handle, 0, sizeof(struct ncclIbHandle));
   handle->magic = NCCL_SOCKET_MAGIC;
   handle->channelId = ncclIbAllocateChannel();
-  // INFO(NCCL_INIT|NCCL_NET, "NET/IB : thread %p Using channel %d", pthread_self(), handle->channelId);
+  // INFO(NCCL_INIT|NCCL_NET, "NET/FuseLink : thread %p Using channel %d", pthread_self(), handle->channelId);
   comm->channelId = handle->channelId;
   
   comm->dev = dev;
@@ -688,11 +730,11 @@ ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm, ncclNet
   struct ncclIbHandle* handle = (struct ncclIbHandle*) opaqueHandle;
   struct ncclIbCommStage* stage = &handle->stage;
   int channelId = handle->channelId;
-  // INFO(NCCL_INIT|NCCL_NET, "NET/IB : thread %p Using channel %d for connection", pthread_self(), handle->channelId);
+  // INFO(NCCL_INIT|NCCL_NET, "NET/FuseLink : thread %p Using channel %d for connection", pthread_self(), handle->channelId);
 
   if (channelId == 0 && fuselink_conn_manager->tx_setup_state_ == FuseLinkConnSetupStateInit) {
     // init fuselink connections
-    INFO(NCCL_INIT|NCCL_NET, "init fuselink connections TX");
+    // INFO(NCCL_INIT|NCCL_NET, "init fuselink connections TX");
     fuselink_conn_manager->tx_setup_state_ = FuseLinkConnSetupStatePending;
     for (uint i = fuselink_conn_manager->GetTxNum(); i < ncclNIbDevs; i++) {
       // if (i == dev) {
@@ -700,7 +742,7 @@ ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm, ncclNet
       //   continue;
       // }
       void* tmpSendComm = NULL;
-      INFO(NCCL_INIT|NCCL_NET, "connecting # %d", i);
+      // INFO(NCCL_INIT|NCCL_NET, "connecting # %d", i);
       ncclIbConnect(i, handle, &tmpSendComm, NULL);
       if (tmpSendComm != NULL) {
         // fuselink init from this sendcomm
@@ -785,10 +827,10 @@ ib_connect_check:
 
   if (qpInfo.link_layer == IBV_LINK_LAYER_INFINIBAND) { // IB
     for (int q=0; q<comm->nqps; q++)
-      INFO(NCCL_NET,"NET/IB: Dev %d Port %d qpn %d mtu %d LID %d", dev, ncclIbDevs[dev].port, qpInfo.qpn[q], qpInfo.mtu, qpInfo.lid);
+      INFO(NCCL_NET,"NET/FuseLink: Dev %d Port %d qpn %d mtu %d LID %d", dev, ncclIbDevs[dev].port, qpInfo.qpn[q], qpInfo.mtu, qpInfo.lid);
   } else { // RoCE
     for (int q=0; q<comm->nqps; q++)
-      INFO(NCCL_NET,"NET/IB: Dev %d Port %d qpn %d mtu %d query_ece={supported=%d, vendor_id=0x%x, options=0x%x, comp_mask=0x%x} GID %ld (%lX/%lX)",
+      INFO(NCCL_NET,"NET/FuseLink: Dev %d Port %d qpn %d mtu %d query_ece={supported=%d, vendor_id=0x%x, options=0x%x, comp_mask=0x%x} GID %ld (%lX/%lX)",
         dev, ncclIbDevs[dev].port, qpInfo.qpn[q], qpInfo.mtu, qpInfo.ece_supported[q], qpInfo.ece[q].vendor_id, qpInfo.ece[q].options, qpInfo.ece[q].comp_mask, ncclParamIbGidIndex(),
         qpInfo.spn, qpInfo.iid);
   }
@@ -827,11 +869,13 @@ ib_connect:
 
   if (qpInfo.link_layer == IBV_LINK_LAYER_ETHERNET ) { // RoCE
     for (int q=0; q<comm->nqps; q++)
-      INFO(NCCL_NET,"NET/IB: Dev %d Port %d qpn %d set_ece={supported=%d, vendor_id=0x%x, options=0x%x, comp_mask=0x%x}",
+      INFO(NCCL_NET,"NET/FuseLink: Dev %d Port %d qpn %d set_ece={supported=%d, vendor_id=0x%x, options=0x%x, comp_mask=0x%x}",
         dev, ncclIbDevs[dev].port, qpInfo.qpn[q], remQpInfo.ece_supported[q], remQpInfo.ece[q].vendor_id, remQpInfo.ece[q].options, remQpInfo.ece[q].comp_mask);
   }
 
   comm->ready = 1;
+  // comm->initialized = 0;// init not ready yet, need to hack upper layer info
+  comm->request_addr = 0;
   stage->state = ncclIbCommStateConnected;
   stage->offset = 0;
 
@@ -859,7 +903,7 @@ ncclResult_t ncclIbAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle
   // INFO(NCCL_INIT|NCCL_NET, "channel id %d fuselink state %d", lComm->channelId, fuselink_conn_manager->rx_setup_state_);
 
   if (lComm->channelId == 0 && fuselink_conn_manager->rx_setup_state_ == FuseLinkConnSetupStateInit) {
-    INFO(NCCL_INIT|NCCL_NET, "init fuselink connections RX");
+    // INFO(NCCL_INIT|NCCL_NET, "init fuselink connections RX");
     fuselink_conn_manager->rx_setup_state_ = FuseLinkConnSetupStatePending;
     for (uint i = fuselink_conn_manager->GetRxNum(); i < ncclNIbDevs; i++) {
       // if (i == lComm->dev) {
@@ -867,7 +911,7 @@ ncclResult_t ncclIbAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle
       //   continue;
       // }
       void* tmpRecvComm = NULL;
-      INFO(NCCL_INIT|NCCL_NET, "accepting # %d", i);
+      // INFO(NCCL_INIT|NCCL_NET, "accepting # %d", i);
       int tmp_dev = lComm->dev;
       lComm->dev = i;
       ncclIbAccept(listenComm, &tmpRecvComm, NULL);
@@ -899,7 +943,7 @@ ncclResult_t ncclIbAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle
   NCCLCHECK(ncclIbMalloc((void**)&rComm, sizeof(struct ncclIbRecvComm)));
   stage->comm = rComm;
   stage->state = ncclIbCommStateAccept;
-  // INFO(NCCL_INIT|NCCL_NET, "NET/IB : thread %p Using channel %d for ACCEPT", pthread_self(), lComm->channelId);
+  // INFO(NCCL_INIT|NCCL_NET, "NET/FuseLink : thread %p Using channel %d for ACCEPT", pthread_self(), lComm->channelId);
   NCCLCHECK(ncclSocketInit(&rComm->sock));
   NCCLCHECK(ncclSocketAccept(&rComm->sock, &lComm->sock));
 
@@ -1020,6 +1064,7 @@ ib_recv_ready:
   rComm->n_finished = 0;
   rComm->channelId = lComm->channelId;
   rComm->txAvailable = 0xffffffff; // all available, place holder.
+  rComm->request_addr = 0;
 
   /* reset lComm stage */
   stage->state = ncclIbCommStateStart;
@@ -1041,7 +1086,7 @@ ncclResult_t ncclIbGetRequest(struct ncclIbVerbs* verbs, struct ncclIbRequest** 
       return ncclSuccess;
     }
   }
-  WARN("NET/IB : unable to allocate requests");
+  WARN("NET/FuseLink : unable to allocate requests");
   *req = NULL;
   return ncclInternalError;
 }
@@ -1097,16 +1142,20 @@ ncclResult_t MemRemap(void* data, CUmemGenericAllocationHandle *hdl, int src_dev
   CUdeviceptr base;
   size_t b_size;
   MYCUCHECK(cuMemGetAddressRange(&base, &b_size, (CUdeviceptr)data));
-  CreateMem(target_dev, hdl, b_size);
+  NCCLCHECK(CreateMem(target_dev, hdl, b_size));
   auto start = std::chrono::high_resolution_clock::now();
 
+  CUmemGenericAllocationHandle old_handle;
+  MYCUCHECK(cuMemRetainAllocationHandle(&old_handle, (void*) base));
   MYCUCHECK(cuMemUnmap(base, b_size));
   // MYCUCHECK(cuMemUnmap((CUdeviceptr)data, b_size));
   // MYCUCHECK(cuMemAddressFree((CUdeviceptr)data, b_size));
+  // MYCUCHECK(cuMemRelease(old_handle));
 
 
   // CUdeviceptr tmp;
   // MYCUCHECK(cuMemAddressReserve(&tmp, b_size, 0, (CUdeviceptr)data, 0));
+  // MYCUCHECK(cuMemMap(base, b_size, 0, old_handle, 0));
   MYCUCHECK(cuMemMap(base, b_size, 0, *hdl, 0));
 
   auto end = std::chrono::high_resolution_clock::now();
@@ -1130,92 +1179,145 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
   static __thread uintptr_t pageSize = 0;
   if (pageSize == 0) pageSize = sysconf(_SC_PAGESIZE);
 
+  INFO(NCCL_NET, "registering memory on addr %p type %d size %zu", data, type, size);
+  // sleep(30);
 
-  struct FuseLinkMr* fl_mr = new FuseLinkMr(ncclNIbDevs);
-  *mhandle = fl_mr;
   struct ncclIbVerbs* verbs = (struct ncclIbVerbs*)comm;
 
-  // /*
-  // Start modifying memory location
-  // */
-  // CUmemGenericAllocationHandle hdl1;
-  // int data_dev = -1;
-  // if (type == NCCL_PTR_CUDA && data != NULL) {
-  //   MYCUCHECK(cuPointerGetAttribute(&data_dev, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)data));
-  //   if (data_dev != verbs->dev) {
-  //     INFO(NCCL_NET, "Data is on device %d, remapping to device %d", data_dev, verbs->dev);
-  //     MemRemap(data, &hdl1, data_dev, verbs->dev);
-  //   }
-  // }
-  // /*
-  // Finish modifying memory location
-  // */
 
   uintptr_t addr = (uintptr_t)data & -pageSize;
   size_t pages = ((uintptr_t)data + size - addr + pageSize-1)/pageSize;
-  ncclResult_t res;
-  for (int idev = 0; idev < ncclNIbDevs; idev++) {
-    struct ncclIbMrCache* cache = &ncclIbDevs[idev].mrCache;
-    pthread_mutex_lock(&ncclIbDevs[idev].lock);
-    INFO(NCCL_INIT|NCCL_NET, "NET/IB : register on dev %d", idev);
-    for (int slot=0; /*true*/; slot++) {
-      if (slot == cache->population) { // didn't find in cache
-        if (cache->population == cache->capacity) { // must grow cache
-          cache->capacity = cache->capacity < 32 ? 32 : 2*cache->capacity;
-          NCCLCHECKGOTO(ncclRealloc(&cache->slots, cache->population, cache->capacity), res, returning);
-        }
-        // Deregister / register
-        struct ibv_mr* mr;
-        unsigned int flags = IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_REMOTE_READ;
-        if (ncclIbRelaxedOrderingEnabled) flags |= IBV_ACCESS_RELAXED_ORDERING;
-        if (fd != -1) {
-          /* DMA-BUF support */
-          NCCLCHECKGOTO(wrap_ibv_reg_dmabuf_mr(&mr, ncclIbDevs[idev].pd, offset, pages*pageSize, addr, fd, flags), res, returning);
-        } else {
-          if (ncclIbRelaxedOrderingEnabled) {
-            // Use IBVERBS_1.8 API - needed for IBV_ACCESS_RELAXED_ORDERING support
-            INFO(NCCL_NET, "registering memory on addr %p", addr);
-            NCCLCHECKGOTO(wrap_ibv_reg_mr_iova2(&mr, ncclIbDevs[idev].pd, (void*)addr, pages*pageSize, addr, flags), res, returning);
-          }
-          else {
-            NCCLCHECKGOTO(wrap_ibv_reg_mr(&mr, ncclIbDevs[idev].pd, (void*)addr, pages*pageSize, flags), res, returning);
-          }
-        }
-        INFO(NCCL_INIT,"dev %d regAddr %llx size %lld lkey %x rkey %x fd %d", idev, (unsigned long long)addr, (long long)pages*pageSize, mr->lkey, mr->rkey, fd);
-        cache->population += 1;
-        cache->slots[slot].addr = addr;
-        cache->slots[slot].pages = pages;
-        cache->slots[slot].refs = 1;
-        cache->slots[slot].mr = mr;
-        fl_mr->ib_mrs[idev] = mr;
-        res = ncclSuccess;
-        goto returning;
-      }
-      else if (cache->slots[slot].addr == addr && cache->slots[slot].pages == pages) {
-        cache->slots[slot].refs += 1;
-        fl_mr->ib_mrs[idev] = cache->slots[slot].mr;
-        res = ncclSuccess;
-        goto returning;
-      }
-    }
 
-    returning:
-    pthread_mutex_unlock(&ncclIbDevs[idev].lock);
-    if (res == ncclSuccess) continue;
-    else {
-      // dereg previous mrs
-      for (int t = 0; t < idev; t++) {
-        if (fl_mr->ib_mrs[t] != NULL) {
-          NCCLCHECK(wrap_ibv_dereg_mr(fl_mr->ib_mrs[t]));
-          fl_mr->ib_mrs[t] = NULL;
-        }
-      }
-      delete fl_mr->ib_mrs;
-      delete fl_mr;
-      return res;
+  void *base_addr = NULL;
+  size_t base_size = 0;
+  int gpu_id = -1;
+  if (type == NCCL_PTR_CUDA) {
+    MYCUCHECK(cuPointerGetAttribute(&gpu_id, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)data));
+    INFO(NCCL_NET, "gpu_id %d", gpu_id);
+    if (gpu_id >= 0) {
+      MYCUCHECK(cuMemGetAddressRange((CUdeviceptr*)&base_addr, &base_size, (CUdeviceptr)data));
+      INFO(NCCL_NET, "base_addr %p, base_size %zu", base_addr, base_size);
+    } else {
+      WARN("NET/FuseLink: gpu_id %d is invalid", gpu_id);
+      return ncclInternalError;
     }
-
+  } else {
+    base_addr = (void *) addr;
+    base_size = pages * pageSize;
   }
+  INFO(NCCL_NET, "find %p", base_addr);
+  pthread_mutex_lock(&addr2flmhdl_lock);
+  if (addr2flmhdl.find(base_addr) != addr2flmhdl.end()) {
+    auto flmhdl = addr2flmhdl.at(base_addr);
+    pthread_mutex_unlock(&addr2flmhdl_lock);
+    // update nrefs
+    pthread_mutex_lock(&flmhdl->flmr->lock);
+    flmhdl->flmr->nrefs++;
+    pthread_mutex_unlock(&flmhdl->flmr->lock);
+    *mhandle = flmhdl;
+    return ncclSuccess;
+  }
+
+  // register base_addr, base_size 
+  INFO(NCCL_NET, "FuseLink memregion CREATE");
+  FuseLinkMemRegion *flmr = new FuseLinkMemRegion();
+  FuseLinkMemHandle *flmhdl = new FuseLinkMemHandle();
+  *mhandle = flmhdl;
+  INFO(NCCL_NET, "FuseLink memregion CREATE done");
+  flmhdl->flmr = flmr;
+  flmhdl->start_addr = (uintptr_t) base_addr;
+  INFO(NCCL_NET, "Fuselink get cupointer dev on %p %d %p", base_addr, flmhdl->dev, cuPointerGetAttribute);
+  if (type == NCCL_PTR_CUDA) {
+    MYCUCHECK(cuPointerGetAttribute(&(flmhdl->dev), CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)base_addr));
+  } else {
+    flmhdl->dev = MAX_GPU_NUM;
+  }
+  INFO(NCCL_NET, "Fuselink memregion init");
+  FuseLinkMemRegionInit(NGPUs, base_addr, base_size, flmhdl->dev, flmr, type == NCCL_PTR_CUDA);
+  INFO(NCCL_NET, "Fuselink memregion init done");
+  pthread_mutex_unlock(&addr2flmhdl_lock);
+  addr2flmhdl[base_addr] = flmhdl;
+  pthread_mutex_unlock(&addr2flmhdl_lock);
+
+
+  // register memory on devices
+  std::vector<int> dataDevs;
+  if (type == NCCL_PTR_CUDA) {
+    for (int i = 0; i < NGPUs; i++) {
+      dataDevs.push_back(i);
+    }
+  } else {
+    dataDevs.push_back(flmhdl->dev);
+  }
+
+  ncclResult_t res;
+  // for all data devices
+  for (auto data_dev : dataDevs) {
+    void *target_addr = (void*) flmhdl->flmr->addr[data_dev];
+    struct ibv_mr** mrs = flmhdl->flmr->mr[data_dev];
+    INFO(NCCL_NET, "Registering memory on device %d %p", data_dev, target_addr);
+    // for all ib devices
+    for (int idev = 0; idev < ncclNIbDevs; idev++) {
+      struct ncclIbMrCache* cache = &ncclIbDevs[idev].mrCache;
+      pthread_mutex_lock(&ncclIbDevs[idev].lock);
+      for (int slot=0; /*true*/; slot++) {
+        if (slot == cache->population) { // didn't find in cache
+          if (cache->population == cache->capacity) { // must grow cache
+            cache->capacity = cache->capacity < 32 ? 32 : 2*cache->capacity;
+            NCCLCHECKGOTO(ncclRealloc(&cache->slots, cache->population, cache->capacity), res, returning);
+          }
+          // Deregister / register
+          struct ibv_mr* mr;
+          unsigned int flags = IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_REMOTE_READ;
+          if (ncclIbRelaxedOrderingEnabled) flags |= IBV_ACCESS_RELAXED_ORDERING;
+          if (fd != -1) {
+            /* DMA-BUF support */
+            NCCLCHECKGOTO(wrap_ibv_reg_dmabuf_mr(&mr, ncclIbDevs[idev].pd, offset, base_size, (uintptr_t) target_addr, fd, flags), res, returning);
+          } else {
+            if (ncclIbRelaxedOrderingEnabled) {
+              // Use IBVERBS_1.8 API - needed for IBV_ACCESS_RELAXED_ORDERING support
+              NCCLCHECKGOTO(wrap_ibv_reg_mr_iova2(&mr, ncclIbDevs[idev].pd, (void*)target_addr, base_size, (uintptr_t) target_addr, flags), res, returning);
+            }
+            else {
+              NCCLCHECKGOTO(wrap_ibv_reg_mr(&mr, ncclIbDevs[idev].pd, (void *)target_addr, base_size, flags), res, returning);
+            }
+          }
+          INFO(NCCL_INIT,"dev %d regAddr %llx size %lld lkey %x rkey %x type %d", idev, (unsigned long long)target_addr, (long long)pages*pageSize, mr->lkey, mr->rkey, type);
+          cache->population += 1;
+          cache->slots[slot].addr = addr;
+          cache->slots[slot].pages = pages;
+          cache->slots[slot].refs = 1;
+          cache->slots[slot].mr = mr;
+          mrs[idev] = mr;
+          res = ncclSuccess;
+          goto returning;
+        }
+        else if (cache->slots[slot].addr == addr && cache->slots[slot].pages == pages) { // found in cache
+          cache->slots[slot].refs += 1;
+          mrs[idev] = cache->slots[slot].mr;
+          res = ncclSuccess;
+          goto returning;
+        }
+      } // for all slots
+
+      returning:
+      pthread_mutex_unlock(&ncclIbDevs[idev].lock);
+      if (res == ncclSuccess) continue;
+      else {
+        // dereg previous mrs
+        for (int t = 0; t < idev; t++) {
+          if (mrs[t] != NULL) {
+            NCCLCHECK(wrap_ibv_dereg_mr(mrs[t]));
+            mrs[t] = NULL;
+          }
+        }
+        // TODO: Destroy flmr, flmhdl
+        return res;
+      }
+
+    }
+  }
+
   return ncclSuccess;
 }
 
@@ -1227,13 +1329,24 @@ ncclResult_t ncclIbRegMr(void* comm, void* data, int size, int type, void** mhan
 ncclResult_t ncclIbDeregMr(void* comm, void* mhandle) {
   struct ncclIbVerbs* verbs = (struct ncclIbVerbs*)comm;
   ncclResult_t res;
-  struct FuseLinkMr* fl_mr = (struct FuseLinkMr*)mhandle;
+  struct FuseLinkMemHandle* flmhdl = (struct FuseLinkMemHandle*)mhandle;
+  int dev = flmhdl->dev;
+  struct FuseLinkMemRegion* flmr = flmhdl->flmr;
   // deregister on all devices
+  // lock flmr
+  INFO(NCCL_NET, "Deregistering memory on gpu device %d", dev);
+  pthread_mutex_lock(&flmr->lock);
+  flmr->nrefs--;
+  if (flmr->nrefs > 0) {
+    INFO(NCCL_NET, "flmr->nrefs %d", flmr->nrefs);
+    pthread_mutex_unlock(&flmr->lock);
+    return ncclSuccess;
+  }
   for (int idev = 0; idev < ncclNIbDevs; idev++) {
     pthread_mutex_lock(&ncclIbDevs[idev].lock);
     struct ncclIbMrCache* cache = &ncclIbDevs[idev].mrCache;
     for (int i=0; i < cache->population; i++) {
-      if (fl_mr->ib_mrs[idev] == cache->slots[i].mr) {
+      if (flmr->mr[flmhdl->dev][idev] == cache->slots[i].mr) {
         if (0 == --cache->slots[i].refs) {
           memmove(&cache->slots[i], &cache->slots[--cache->population], sizeof(struct ncclIbMr));
           if (cache->population == 0) {
@@ -1241,19 +1354,47 @@ ncclResult_t ncclIbDeregMr(void* comm, void* mhandle) {
             cache->slots = NULL;
             cache->capacity = 0;
           }
-          NCCLCHECKGOTO(wrap_ibv_dereg_mr(fl_mr->ib_mrs[idev]), res, returning);
+          NCCLCHECKGOTO(wrap_ibv_dereg_mr(flmr->mr[flmhdl->dev][idev]), res, returning);
         }
         res = ncclSuccess;
         goto returning;
       }
     }
-    WARN("NET/IB: could not find mr %p inside cache of %d entries", mhandle, cache->population);
-    res = ncclInternalError;
+    
+    // WARN("NET/FuseLink: could not find mr %p inside cache of %d entries", mhandle, cache->population);
+    // res = ncclInternalError;
     returning:
     pthread_mutex_unlock(&ncclIbDevs[idev].lock);
     if (res == ncclSuccess) continue;
     else return res;
   }
+
+  if (flmr->nrefs == 0) {
+    INFO(NCCL_NET, "DESTROYING FLMHDL");
+    if (flmhdl->dev != MAX_GPU_NUM) { // cpu memory
+      // release all memory handles in flmr
+      for (int i = 0; i < NGPUs; i++) {
+        if (flmr->addr[i] != NULL) {
+          MYCUCHECK(cuMemUnmap(flmr->addr[i], flmr->sz));
+          MYCUCHECK(cuMemAddressFree(flmr->addr[i], flmr->sz));
+          if (i != flmhdl->dev) {
+            MYCUCHECK(cuMemRelease(flmr->hdl[i]));
+          }
+        }
+      }
+    }
+    INFO(NCCL_NET, "released all memory handles");
+    pthread_mutex_unlock(&flmr->lock);
+    pthread_mutex_destroy(&flmr->lock);
+    pthread_mutex_lock(&addr2flmhdl_lock);
+    addr2flmhdl.erase((void *) flmhdl->start_addr);
+    pthread_mutex_unlock(&addr2flmhdl_lock);
+    delete flmr;
+    delete flmhdl;
+  }
+
+
+
   return ncclSuccess;
 }
 
@@ -1296,7 +1437,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       immData = fuselink_conn_manager->getTxUsage(); // cached.
     }
   } else {
-    WARN("NET/IB: multi-send not allowed");
+    WARN("NET/FuseLink: multi-send not allowed");
     return ncclInternalError;
   }
 
@@ -1331,8 +1472,8 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       }
     }
     struct ibv_send_wr* bad_wr;
-    INFO(NCCL_INIT, "multisend %p dev %d sge addr %llx raddr %llx lkey %x rkey %x", data_comm, data_comm->verbs.dev, (unsigned long long)data_comm->wrs[0].sg_list->addr, \
-     data_comm->wrs[0].wr.rdma.remote_addr, data_comm->wrs[0].sg_list->lkey, data_comm->wrs[0].wr.rdma.rkey);
+    INFO(NCCL_INIT, "multisend %p dev %d sge addr %llx size %ld raddr %llx lkey %x rkey %x", data_comm, data_comm->verbs.dev, (unsigned long long)data_comm->wrs[0].sg_list->addr, \
+     data_comm->wrs[0].sg_list->length, data_comm->wrs[0].wr.rdma.remote_addr, data_comm->wrs[0].sg_list->lkey, data_comm->wrs[0].wr.rdma.rkey);
     NCCLCHECK(wrap_ibv_post_send(data_comm->qps[data_comm->qpIndex], data_comm->wrs, &bad_wr));
     data_comm->qpIndex = (data_comm->qpIndex+1)%data_comm->nqps;
 
@@ -1349,7 +1490,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
 
 ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
-  if (comm->ready == 0) { WARN("NET/IB: ncclIbIsend() called when comm->ready == 0"); return ncclInternalError; }
+  if (comm->ready == 0) { WARN("NET/FuseLink: ncclIbIsend() called when comm->ready == 0"); return ncclInternalError; }
   if (comm->ready == 0) { *request = NULL; return ncclSuccess; }
   // printf("size: %d\n", size);
 
@@ -1370,6 +1511,20 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
   for (int r=1; r<nreqs; r++) while(slots[r].idx != idx);
   __sync_synchronize(); // order the nreqsPtr load against tag/rkey/addr loads below
 
+
+  // check if initialized
+  if (get_addr_abs((uintptr_t) request, comm->request_addr) > UPDATE_HACKING_THRESHOLD) {
+    struct ncclProxySubArgsForHacking* sub = (struct ncclProxySubArgsForHacking*) \
+     ((uintptr_t) request - offsetof(struct ncclProxySubArgsForHacking, requests));
+    comm->posted = &sub->posted; // posted to gpu
+    comm->received = &sub->received;
+    comm->flushed = &sub->flushed;
+    comm->transmitted = &sub->transmitted; // send to NIC
+    comm->done = &sub->done; // send successfully
+    comm->request_addr = (uintptr_t) request;
+  } 
+  INFO(NCCL_INIT, "isend %p posted %d received %d flushed %d transmitted %d done %d", \
+    comm->posted, *comm->posted, *comm->received, *comm->flushed, *comm->transmitted, *comm->done);
   // ..
   // select the proper comm
   INFO(NCCL_INIT|NCCL_NET, "fuselink_offset %d", slots[0].fuselink_offset);
@@ -1394,7 +1549,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
       char line[SOCKET_NAME_MAXLEN + 1];
       union ncclSocketAddress addr;
       ncclSocketGetAddr(&comm->sock, &addr);
-      WARN("NET/IB : req %d/%d tag %x peer %s collective mismatch error, local size %d remote size %d",
+      WARN("NET/FuseLink : req %d/%d tag %x peer %s collective mismatch error, local size %d remote size %d",
         r, nreqs, tag, ncclSocketToString(&addr, line), size, slots[r].size);
       return ncclInvalidUsage;
     } // plus any potential programming errors
@@ -1402,22 +1557,31 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
       char line[SOCKET_NAME_MAXLEN + 1];
       union ncclSocketAddress addr;
       ncclSocketGetAddr(&comm->sock, &addr);
-      WARN("NET/IB : req %d/%d tag %x peer %s posted incorrect receive info: size %d addr %lx rkey %x",
+      WARN("NET/FuseLink : req %d/%d tag %x peer %s posted incorrect receive info: size %d addr %lx rkey %x",
         r, nreqs, tag, ncclSocketToString(&addr, line), slots[r].size, slots[r].addr, slots[r].rkey);
       return ncclInternalError;
     }
     struct ncclIbRequest* req;
     NCCLCHECK(ncclIbGetRequest(&comm->side_comm->verbs, &req));
+    struct FuseLinkMemHandle* flmhdl = (struct FuseLinkMemHandle*) mhandle;
     req->type = NCCL_NET_IB_REQ_SEND;
     req->ibComm = comm;
     req->verbs = &comm->side_comm->verbs;
     req->side_verbs = NULL;
     req->nreqs = nreqs;
     req->send.size = size;
-    req->send.data = data;
-    req->send.lkey = fl_mr->ib_mrs[comm->side_comm->verbs.dev]->lkey;
+    // convert data to fuselink address
+    INFO(NCCL_NET, "data %p, on dev %d, comm_dev %d", data, flmhdl->dev, comm->side_comm->verbs.dev);
+    req->send.data = (void *) (flmhdl->flmr->addr[flmhdl->dev] + data - flmhdl->start_addr);
+    // req->send.data = data;
+    req->send.lkey = flmhdl->flmr->mr[flmhdl->dev][comm->side_comm->verbs.dev]->lkey;
     req->send.offset = 0;
     req->events = ncclParamIbSplitDataOnQps() ? comm->side_comm->nqps : 1;
+    req->posted = comm->posted;
+    req->received = comm->received;
+    req->flushed = comm->flushed;
+    req->transmitted = comm->transmitted;
+    req->done = comm->done;
     if (comm->side_comm->gidInfo.link_layer == IBV_LINK_LAYER_ETHERNET) req->gidInfo = &comm->side_comm->gidInfo;
     *request = reqs[r] = req;
 
@@ -1449,11 +1613,11 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
   struct ncclIbSendFifo* localElem = comm->remFifo.elems[slot];
 
   for (int i=0; i<n; i++) {
-    localElem[i].addr = (uint64_t)data[i];
-    // todo: revise this as the proper mr
-    struct FuseLinkMr* fl_mr = (struct FuseLinkMr*) mhandles[i];
-    struct ibv_mr* mr = fl_mr->ib_mrs[comm->side_comm->verbs.dev];
-    localElem[i].rkey = mr->rkey;
+    struct FuseLinkMemHandle* flmhdl = (struct FuseLinkMemHandle*) mhandles[i];
+    // convert data to fuselink address
+    localElem[i].addr = (uint64_t) (flmhdl->flmr->addr[flmhdl->dev] + data[i] - flmhdl->start_addr);
+    struct ibv_mr* mr = flmhdl->flmr->mr[flmhdl->dev][comm->side_comm->verbs.dev];
+    localElem[i].rkey = mr->lkey;
     localElem[i].nreqs = n;
     localElem[i].size = sizes[i]; // Sanity/Debugging
     localElem[i].tag = tags[i];
@@ -1506,7 +1670,7 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
 
 ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
-  if (comm->ready == 0) { WARN("NET/IB: ncclIbIrecv() called when comm->ready == 0"); return ncclInternalError; }
+  if (comm->ready == 0) { WARN("NET/FuseLink: ncclIbIrecv() called when comm->ready == 0"); return ncclInternalError; }
   if (comm->ready == 0) { *request = NULL; return ncclSuccess; }
   if (n > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
 
@@ -1515,7 +1679,7 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
     // update side comm
     // INFO(NCCL_INIT, "UPDATING %p", fuselink_conn_manager);
     comm->side_comm = (ncclIbRecvComm *) fuselink_conn_manager->refreshRxComm(comm->channelId, comm->txAvailable, ncclNIbDevs, &comm->fuselink_offset);
-    INFO(NCCL_INIT, "ncclIbIrecv: update side comm %p", comm->side_comm);
+    INFO(NCCL_INIT, "ncclIbIrecv: update side comm %p, channelId %d, fuselink_offset %d", comm->side_comm, comm->channelId, comm->fuselink_offset);
   }
   if (comm->side_comm == NULL) {
     comm->side_comm = comm;
@@ -1552,12 +1716,32 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
   req->events = nqps;
 
   *request = req;
+  // need to hack upper layer info
+  if (get_addr_abs((uintptr_t) request, comm->request_addr) > UPDATE_HACKING_THRESHOLD) {
+    struct ncclProxySubArgsForHacking* sub = (struct ncclProxySubArgsForHacking*) \
+     ((uintptr_t) request - offsetof(struct ncclProxySubArgsForHacking, requests));
+    comm->posted = &sub->posted;
+    comm->received = &sub->received;
+    comm->flushed = &sub->flushed;
+    comm->transmitted = &sub->transmitted;
+    comm->done = &sub->done;
+    comm->request_addr = (uintptr_t) request;
+  }
+  INFO(NCCL_INIT, "recv %p posted %d received %d flushed %d transmitted %d done %d", \
+     comm->posted, *comm->posted, *comm->received, *comm->flushed, *comm->transmitted, *comm->done);
+  
+  req->posted = comm->posted;
+  req->received = comm->received;
+  req->flushed = comm->flushed;
+  req->transmitted = comm->transmitted;
+  req->done = comm->done;
 
   // Post to FIFO to notify sender
   TIME_START(2);
   // comm is actually the fifo_comm
   NCCLCHECK(ncclIbPostFifo(comm, n, data, sizes, tags, mhandles, req, comm->fuselink_offset));
   TIME_STOP(2);
+
   return ncclSuccess;
 }
 
@@ -1649,7 +1833,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
             localGidStr = inet_ntop(AF_INET6, &r->gidInfo->localGid, localGidString, sizeof(localGidString));
             remoteGidStr = inet_ntop(AF_INET6, &r->gidInfo->remoteGid, remoteGidString, sizeof(remoteGidString));
         }
-        WARN("NET/IB : Got completion from peer %s with error %d, wr_id %d, dev %d, comm %p, opcode %d, len %d, vendor err %d (%s)%s%s%s%s",
+        WARN("NET/FuseLink : Got completion from peer %s with error %d, wr_id %d, dev %d, comm %p, opcode %d, len %d, vendor err %d (%s)%s%s%s%s",
             ncclSocketToString(&addr, line), wc->status, wc->wr_id, r->verbs->dev, r->ibComm, wc->opcode, wc->byte_len, wc->vendor_err, reqTypeStr[r->type],
             localGidStr ?  " localGid ":"", localGidString, remoteGidStr ? " remoteGid ":"", remoteGidString);
         return ncclRemoteError;
@@ -1671,7 +1855,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
             //   req->recv.sizes[i] = (wc->imm_data >> i) & 0x1;
             // }
             // not allowed
-            WARN("NET/IB: multi recv not allowed");
+            WARN("NET/FuseLink: multi recv not allowed");
             return ncclInternalError;
           } else {
             // req->recv.sizes[0] += wc->imm_data;
@@ -1704,7 +1888,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
             localGidStr = inet_ntop(AF_INET6, &r->gidInfo->localGid, localGidString, sizeof(localGidString));
             remoteGidStr = inet_ntop(AF_INET6, &r->gidInfo->remoteGid, remoteGidString, sizeof(remoteGidString));
         }
-        WARN("NET/IB : Got completion from peer %s with error %d, wr_id %d, dev %d, comm %p, opcode %d, len %d, vendor err %d (%s)%s%s%s%s",
+        WARN("NET/FuseLink : Got completion from peer %s with error %d, wr_id %d, dev %d, comm %p, opcode %d, len %d, vendor err %d (%s)%s%s%s%s",
             ncclSocketToString(&addr, line), wc->status, wc->wr_id, r->verbs->dev, r->ibComm, wc->opcode, wc->byte_len, wc->vendor_err, reqTypeStr[r->type],
             localGidStr ?  " localGid ":"", localGidString, remoteGidStr ? " remoteGid ":"", remoteGidString);
         return ncclRemoteError;
@@ -1726,7 +1910,7 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
             //   req->recv.sizes[i] = (wc->imm_data >> i) & 0x1;
             // }
             // not allowed
-            WARN("NET/IB: multi recv not allowed");
+            WARN("NET/FuseLink: multi recv not allowed");
             return ncclInternalError;
           } else {
             // req->recv.sizes[0] += wc->imm_data;
@@ -1741,6 +1925,12 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
     }
     
   } // while 1
+
+  // for sending, if we need to change path, we need to wait until all other sending requests in the buffer are done
+  // in addition, we need to make sure that the GPU is not writing to the buffer
+
+  // for receiving, if we need to change path, all received data must be consumed
+  // and there should not be any outstanding receive requests
 }
 
 ncclResult_t ncclIbCloseSend(void* sendComm) {

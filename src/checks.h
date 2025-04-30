@@ -6,7 +6,7 @@
 
 #define FUSELINK_WARN(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__)
 // Check CUDA RT calls
-#define CUDACHECK(cmd) do {                                 \
+#define FL_CUDACHECK(cmd) do {                                 \
     cudaError_t err = cmd;                                  \
     if( err != cudaSuccess ) {                              \
         FUSELINK_WARN("Cuda failure '%s'", cudaGetErrorString(err)); \
@@ -14,15 +14,15 @@
     }                                                       \
 } while(false)
 // check driver API calls
-#define CUCHECK(cmd) do {                                 \
+#define FL_CUCHECK(cmd) do {                                 \
     CUresult err = cmd;                                  \
     if( err != CUDA_SUCCESS ) {                              \
-        FUSELINK_WARN("Cuda failure '%d'", err); \
+        FUSELINK_WARN("Cuda failure '%d' file %s line %d", err, __FILE__, __LINE__); \
         exit(1);                      \
     }                                                       \
 } while(false)
 
-#define CUDACHECKGOTO(cmd, RES, label) do {                 \
+#define FL_CUDACHECKGOTO(cmd, RES, label) do {                 \
     cudaError_t err = cmd;                                  \
     if( err != cudaSuccess ) {                              \
         FUSELINK_WARN("Cuda failure '%s'", cudaGetErrorString(err)); \
@@ -31,7 +31,7 @@
     }                                                       \
 } while(false)
 
-#define CUCHECKGOTO(cmd, RES, label) do {                 \
+#define FL_CUCHECKGOTO(cmd, RES, label) do {                 \
     CUresult err = cmd;                                  \
     if( err != CUDA_SUCCESS ) {                              \
         FUSELINK_WARN("Cuda failure '%d'", err); \
@@ -41,7 +41,7 @@
 } while(false)
 
 // error when call return non-zero
-#define SYS_CHECK_NZ(cmd) do { \
+#define FL_SYS_CHECK_NZ(cmd) do { \
     if (cmd != 0) { \
         FUSELINK_WARN("System call failed with error code %d", cmd); \
         exit(1); \
@@ -49,7 +49,7 @@
 } while(false)
 
 // error when call return zero
-#define SYS_CHECK_Z(cmd) do { \
+#define FL_SYS_CHECK_Z(cmd) do { \
     if (cmd == 0) { \
         FUSELINK_WARN("System call failed with error code %d", cmd); \
         exit(1); \
