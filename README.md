@@ -41,6 +41,30 @@ export LD_LIBRARY_PATH=<FuseLink Dir>/build/lib:$LD_LIBRARY_PATH
 export NCCL_NET_PLUGIN=fuselink
 ```
 
+## Files
+
+```
+src
+├── checks.h
+├── cumem.cu
+├── cumem.h                 necessary operations in CUDA memory
+├── extern                  extern files borrowed from NCCL, may be removed in the future
+│   ├── ibvcore.h
+│   ├── ibvwrap.h
+│   ├── nccl_net.h
+│   ├── param.h
+│   ├── socket.cc
+│   ├── socket.h
+│   ├── timer.h
+│   └── utils.h
+├── fuselink.cc             FuseLink memory structures
+├── fuselink.h
+├── monitor_main.cpp        FuseLink monitors for NIC idleness
+├── monitor.cpp
+├── monitor.h
+└── plugin.cc               FuseLink integrations in NCCL
+```
+
 ## Note for OSDI Artifact
 
 We are actively addressing the additional experiments requested by the Shepherd. Some of the codebase remain under active development and are currently optimized for the specialized configurations of our testing environments.
