@@ -313,7 +313,7 @@ private:
   std::map<int, int> rxchannel2dev_; // dev to comm.
 };
 
-void FuseLinkMemRegionInit(int nGPUs, void* base_addr, size_t size, int dev, FuseLinkMemRegion *flmr, bool is_cuda_mem);
+void FuseLinkMemRegionInit(int nGPUs, void* base_addr, size_t size, int src_dev, int buffer_dev, FuseLinkMemRegion *flmr, bool is_cuda_mem);
 
 void FuseLinkMemRegionDestroy(FuseLinkMemRegion *flmr);
 

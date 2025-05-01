@@ -1,7 +1,7 @@
 #include "fuselink.h"
 #include "checks.h"
 
-void FuseLinkMemRegionInit(int nGPUs, void* base_addr, size_t size, int dev, FuseLinkMemRegion *flmr, bool is_cuda_mem) {
+void FuseLinkMemRegionInit(int nGPUs, void* base_addr, size_t size, int src_dev, int buffer_dev, FuseLinkMemRegion *flmr, bool is_cuda_mem) {
   flmr->nrefs = 0;
   pthread_mutex_init(&flmr->lock, NULL);
 
@@ -45,12 +45,12 @@ void FuseLinkMemRegionInit(int nGPUs, void* base_addr, size_t size, int dev, Fus
   FL_CUCHECK(cuMemUnmap((CUdeviceptr) base_addr, aligned_sz));
   FL_CUCHECK(cuMemRelease(origin_hdl));
 
-  FL_CUCHECK(cuMemMap((CUdeviceptr) base_addr, aligned_sz, 0, flmr->hdl[dev], 0));
+  FL_CUCHECK(cuMemMap((CUdeviceptr) base_addr, aligned_sz, 0, flmr->hdl[buffer_dev], 0));
 
   // enable access to this memory region
   CUmemAccessDesc accessDesc = {};
   accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  accessDesc.location.id = dev;
+  accessDesc.location.id = src_dev;
   accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   FL_CUCHECK(cuMemSetAccess((CUdeviceptr) base_addr, aligned_sz, &accessDesc, 1));
 

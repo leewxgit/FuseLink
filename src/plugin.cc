@@ -508,6 +508,7 @@ struct ncclIbSendFifo {
 struct ncclIbSendComm {
   struct ncclIbVerbs verbs;
   struct ncclIbSendFifo fifo[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
+  int channelId;
   uint64_t fifoHead;
   struct ncclIbRequest* fifoReqs[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
   struct ibv_send_wr wrs[NCCL_NET_IB_MAX_RECVS+1];
@@ -523,7 +524,6 @@ struct ncclIbSendComm {
   struct ibv_mr* fifoMr;
   int ar;
   struct ncclIbGidInfo gidInfo;
-  int channelId;
   int64_t n_finished; // number of finished requests
 
   // int initialized;
@@ -562,6 +562,7 @@ struct ncclIbRemFifo {
 struct ncclIbRecvComm {
   struct ncclIbVerbs verbs;
   struct ncclIbRemFifo remFifo;
+  int channelId;
   struct ncclSocket sock;
   int ready;
   struct ibv_qp* qps[NCCL_IB_MAX_QPS];
@@ -570,7 +571,6 @@ struct ncclIbRecvComm {
   struct ncclIbGpuFlush gpuFlush;
   struct ncclIbGidInfo gidInfo;
 
-  int channelId;
 
   ncclIbRecvComm* side_comm;
   uint32_t txAvailable; // a mask indicating tx nic availability.
@@ -1179,10 +1179,10 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
   static __thread uintptr_t pageSize = 0;
   if (pageSize == 0) pageSize = sysconf(_SC_PAGESIZE);
 
-  INFO(NCCL_NET, "registering memory on addr %p type %d size %zu", data, type, size);
-  // sleep(30);
+  // INFO(NCCL_NET, "registering memory on addr %p type %d size %zu", data, type, size);
 
   struct ncclIbVerbs* verbs = (struct ncclIbVerbs*)comm;
+  int* channelId = (int *) ((uintptr_t) comm + offsetof(struct ncclIbSendComm, channelId));
 
 
   uintptr_t addr = (uintptr_t)data & -pageSize;
@@ -1193,19 +1193,28 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
   int gpu_id = -1;
   if (type == NCCL_PTR_CUDA) {
     MYCUCHECK(cuPointerGetAttribute(&gpu_id, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)data));
-    INFO(NCCL_NET, "gpu_id %d", gpu_id);
+    INFO(NCCL_NET, "NCCL passes gpu pointer on gpu_id %d", gpu_id);
     if (gpu_id >= 0) {
+      int cur_gpu_id;
+      CUDACHECK(cudaGetDevice(&cur_gpu_id));
+      CUDACHECK(cudaSetDevice(gpu_id));
       MYCUCHECK(cuMemGetAddressRange((CUdeviceptr*)&base_addr, &base_size, (CUdeviceptr)data));
+      CUDACHECK(cudaSetDevice(cur_gpu_id));
       INFO(NCCL_NET, "base_addr %p, base_size %zu", base_addr, base_size);
     } else {
       WARN("NET/FuseLink: gpu_id %d is invalid", gpu_id);
       return ncclInternalError;
     }
+    int switch_gpu_id = (gpu_id + *channelId) % NGPUs;
+    if (switch_gpu_id != gpu_id) {
+      INFO(NCCL_NET, "NCCL passes gpu pointer on gpu_id %d, but switch to gpu_id %d", gpu_id, switch_gpu_id);
+    }
+    gpu_id = switch_gpu_id;
   } else {
     base_addr = (void *) addr;
     base_size = pages * pageSize;
+    gpu_id = MAX_GPU_NUM;
   }
-  INFO(NCCL_NET, "find %p", base_addr);
   pthread_mutex_lock(&addr2flmhdl_lock);
   if (addr2flmhdl.find(base_addr) != addr2flmhdl.end()) {
     auto flmhdl = addr2flmhdl.at(base_addr);
@@ -1228,7 +1237,7 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
   flmhdl->start_addr = (uintptr_t) base_addr;
   INFO(NCCL_NET, "Fuselink get cupointer dev on %p %d %p", base_addr, flmhdl->dev, cuPointerGetAttribute);
   if (type == NCCL_PTR_CUDA) {
-    MYCUCHECK(cuPointerGetAttribute(&(flmhdl->dev), CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)base_addr));
+    flmhdl->dev = gpu_id;
   } else {
     flmhdl->dev = MAX_GPU_NUM;
   }
