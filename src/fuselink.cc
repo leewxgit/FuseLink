@@ -45,6 +45,7 @@ void FuseLinkMemRegionInit(int nGPUs, void* base_addr, size_t size, int src_dev,
   FL_CUCHECK(cuMemUnmap((CUdeviceptr) base_addr, aligned_sz));
   FL_CUCHECK(cuMemRelease(origin_hdl));
 
+  printf("map buffer addr %p, size %zu, handle %p bufferdev %d\n", base_addr, aligned_sz, flmr->hdl[buffer_dev], buffer_dev);
   FL_CUCHECK(cuMemMap((CUdeviceptr) base_addr, aligned_sz, 0, flmr->hdl[buffer_dev], 0));
 
   // enable access to this memory region

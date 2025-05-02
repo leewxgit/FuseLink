@@ -51,7 +51,7 @@ struct FuseLinkMemHandle {
   FuseLinkMemRegion *flmr;
 };
 
-typedef std::map<void*, FuseLinkMemHandle*> Addr2FuseLinkMemHandle;
+typedef std::map<void*, FuseLinkMemRegion*> Addr2FuseLinkMemRegion;
 
 enum FuseLinkConnSetupState {
   FuseLinkConnSetupStateInit = 0,

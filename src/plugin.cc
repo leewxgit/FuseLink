@@ -31,8 +31,8 @@
 #include "fuselink.h"
 
 FuseLinkConnManager* fuselink_conn_manager = nullptr;
-pthread_mutex_t addr2flmhdl_lock = PTHREAD_MUTEX_INITIALIZER;
-Addr2FuseLinkMemHandle addr2flmhdl;
+pthread_mutex_t addr2flmr_lock = PTHREAD_MUTEX_INITIALIZER;
+Addr2FuseLinkMemRegion addr2flmr;
 
 #define MAXNAMESIZE 64
 #define N_FINISHED_BATCH 8
@@ -45,16 +45,6 @@ struct ncclIbMr {
   int refs;
   ibv_mr *mr;
 };
-
-struct FuseLinkMr {
-  ibv_mr** ib_mrs;
-  int nMrs;
-  FuseLinkMr(int nDevs) {
-    nMrs = nDevs;
-    ib_mrs = new ibv_mr*[nDevs];
-  }
-};
-
 
 struct ncclIbMrCache {
   struct ncclIbMr *slots;
@@ -476,7 +466,7 @@ struct ncclIbRequest {
   uint64_t* flushed;
   uint64_t* transmitted;
   uint64_t* done;
-
+  int* nsteps;
 };
 
 struct ncclIbVerbs {
@@ -532,6 +522,7 @@ struct ncclIbSendComm {
   uint64_t* flushed;
   uint64_t* transmitted;
   uint64_t* done;
+  int* nsteps;
 
   uintptr_t request_addr;
 };
@@ -584,6 +575,7 @@ struct ncclIbRecvComm {
   uint64_t* flushed;
   uint64_t* transmitted;
   uint64_t* done;
+  int* nsteps;
   // done
   uintptr_t request_addr;
 };
@@ -775,6 +767,7 @@ ncclResult_t ncclIbConnect(int dev, void* opaqueHandle, void** sendComm, ncclNet
 
   NCCLCHECK(ncclIbMalloc((void**)&comm, sizeof(struct ncclIbSendComm)));
   comm->channelId = channelId;
+  comm->n_finished = 0;
   NCCLCHECK(ncclSocketInit(&comm->sock, &handle->connectAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1));
   stage->comm = comm;
   stage->state = ncclIbCommStateConnect;
@@ -1190,35 +1183,41 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
 
   void *base_addr = NULL;
   size_t base_size = 0;
-  int gpu_id = -1;
+  int gpu_id = -1, switch_gpu_id = -1;
   if (type == NCCL_PTR_CUDA) {
     MYCUCHECK(cuPointerGetAttribute(&gpu_id, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)data));
     INFO(NCCL_NET, "NCCL passes gpu pointer on gpu_id %d", gpu_id);
     if (gpu_id >= 0) {
       int cur_gpu_id;
       CUDACHECK(cudaGetDevice(&cur_gpu_id));
-      CUDACHECK(cudaSetDevice(gpu_id));
+      // CUDACHECK(cudaSetDevice(gpu_id));
       MYCUCHECK(cuMemGetAddressRange((CUdeviceptr*)&base_addr, &base_size, (CUdeviceptr)data));
-      CUDACHECK(cudaSetDevice(cur_gpu_id));
-      INFO(NCCL_NET, "base_addr %p, base_size %zu", base_addr, base_size);
+      // CUDACHECK(cudaSetDevice(cur_gpu_id));
+      INFO(NCCL_NET, "addr %p, base_addr %p, base_size %zu, reg size %zu", addr, base_addr, base_size, pages * pageSize);
     } else {
       WARN("NET/FuseLink: gpu_id %d is invalid", gpu_id);
       return ncclInternalError;
     }
-    int switch_gpu_id = (gpu_id + *channelId) % NGPUs;
+    switch_gpu_id = (gpu_id + *channelId) % NGPUs;
     if (switch_gpu_id != gpu_id) {
       INFO(NCCL_NET, "NCCL passes gpu pointer on gpu_id %d, but switch to gpu_id %d", gpu_id, switch_gpu_id);
     }
-    gpu_id = switch_gpu_id;
   } else {
     base_addr = (void *) addr;
     base_size = pages * pageSize;
     gpu_id = MAX_GPU_NUM;
+    switch_gpu_id = MAX_GPU_NUM;
   }
-  pthread_mutex_lock(&addr2flmhdl_lock);
-  if (addr2flmhdl.find(base_addr) != addr2flmhdl.end()) {
-    auto flmhdl = addr2flmhdl.at(base_addr);
-    pthread_mutex_unlock(&addr2flmhdl_lock);
+
+  pthread_mutex_lock(&addr2flmr_lock);
+
+  if (addr2flmr.find(base_addr) != addr2flmr.end()) {
+    FuseLinkMemHandle *flmhdl = new FuseLinkMemHandle();
+    auto flmr = addr2flmr.at(base_addr);
+    pthread_mutex_unlock(&addr2flmr_lock);
+    flmhdl->flmr = flmr;
+    flmhdl->start_addr = (uintptr_t) base_addr;
+    flmhdl->dev = gpu_id;
     // update nrefs
     pthread_mutex_lock(&flmhdl->flmr->lock);
     flmhdl->flmr->nrefs++;
@@ -1235,18 +1234,15 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
   INFO(NCCL_NET, "FuseLink memregion CREATE done");
   flmhdl->flmr = flmr;
   flmhdl->start_addr = (uintptr_t) base_addr;
-  INFO(NCCL_NET, "Fuselink get cupointer dev on %p %d %p", base_addr, flmhdl->dev, cuPointerGetAttribute);
   if (type == NCCL_PTR_CUDA) {
-    flmhdl->dev = gpu_id;
+    flmhdl->dev = switch_gpu_id;
   } else {
     flmhdl->dev = MAX_GPU_NUM;
   }
+  flmhdl->flmr->nrefs = 1;
   INFO(NCCL_NET, "Fuselink memregion init");
-  FuseLinkMemRegionInit(NGPUs, base_addr, base_size, flmhdl->dev, flmr, type == NCCL_PTR_CUDA);
+  FuseLinkMemRegionInit(NGPUs, base_addr, base_size, gpu_id, flmhdl->dev, flmr, type == NCCL_PTR_CUDA);
   INFO(NCCL_NET, "Fuselink memregion init done");
-  pthread_mutex_unlock(&addr2flmhdl_lock);
-  addr2flmhdl[base_addr] = flmhdl;
-  pthread_mutex_unlock(&addr2flmhdl_lock);
 
 
   // register memory on devices
@@ -1264,7 +1260,7 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
   for (auto data_dev : dataDevs) {
     void *target_addr = (void*) flmhdl->flmr->addr[data_dev];
     struct ibv_mr** mrs = flmhdl->flmr->mr[data_dev];
-    INFO(NCCL_NET, "Registering memory on device %d %p", data_dev, target_addr);
+    INFO(NCCL_NET, "Registering memory on device %d %p start_addr %p", data_dev, target_addr, flmhdl->start_addr);
     // for all ib devices
     for (int idev = 0; idev < ncclNIbDevs; idev++) {
       struct ncclIbMrCache* cache = &ncclIbDevs[idev].mrCache;
@@ -1291,9 +1287,9 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
               NCCLCHECKGOTO(wrap_ibv_reg_mr(&mr, ncclIbDevs[idev].pd, (void *)target_addr, base_size, flags), res, returning);
             }
           }
-          INFO(NCCL_INIT,"dev %d regAddr %llx size %lld lkey %x rkey %x type %d", idev, (unsigned long long)target_addr, (long long)pages*pageSize, mr->lkey, mr->rkey, type);
+          INFO(NCCL_INIT,"dev %d regAddr %llx size %lld lkey %x rkey %x type %d start_addr %p", idev, (unsigned long long)target_addr, (long long)base_size, mr->lkey, mr->rkey, type, flmhdl->start_addr);
           cache->population += 1;
-          cache->slots[slot].addr = addr;
+          cache->slots[slot].addr = (uintptr_t) target_addr;
           cache->slots[slot].pages = pages;
           cache->slots[slot].refs = 1;
           cache->slots[slot].mr = mr;
@@ -1301,7 +1297,7 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
           res = ncclSuccess;
           goto returning;
         }
-        else if (cache->slots[slot].addr == addr && cache->slots[slot].pages == pages) { // found in cache
+        else if (cache->slots[slot].addr == (uintptr_t) target_addr && cache->slots[slot].pages == pages) { // found in cache
           cache->slots[slot].refs += 1;
           mrs[idev] = cache->slots[slot].mr;
           res = ncclSuccess;
@@ -1321,11 +1317,14 @@ ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, ui
           }
         }
         // TODO: Destroy flmr, flmhdl
+        pthread_mutex_unlock(&addr2flmr_lock);
         return res;
       }
 
     }
   }
+  addr2flmr[base_addr] = flmr;
+  pthread_mutex_unlock(&addr2flmr_lock);
 
   return ncclSuccess;
 }
@@ -1349,6 +1348,7 @@ ncclResult_t ncclIbDeregMr(void* comm, void* mhandle) {
   if (flmr->nrefs > 0) {
     INFO(NCCL_NET, "flmr->nrefs %d", flmr->nrefs);
     pthread_mutex_unlock(&flmr->lock);
+    delete flmhdl;
     return ncclSuccess;
   }
   for (int idev = 0; idev < ncclNIbDevs; idev++) {
@@ -1395,9 +1395,9 @@ ncclResult_t ncclIbDeregMr(void* comm, void* mhandle) {
     INFO(NCCL_NET, "released all memory handles");
     pthread_mutex_unlock(&flmr->lock);
     pthread_mutex_destroy(&flmr->lock);
-    pthread_mutex_lock(&addr2flmhdl_lock);
-    addr2flmhdl.erase((void *) flmhdl->start_addr);
-    pthread_mutex_unlock(&addr2flmhdl_lock);
+    pthread_mutex_lock(&addr2flmr_lock);
+    addr2flmr.erase((void *) flmhdl->start_addr);
+    pthread_mutex_unlock(&addr2flmr_lock);
     delete flmr;
     delete flmhdl;
   }
@@ -1503,9 +1503,6 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
   if (comm->ready == 0) { *request = NULL; return ncclSuccess; }
   // printf("size: %d\n", size);
 
-  // struct ibv_mr* mr = (struct ibv_mr*)mhandle;
-  struct FuseLinkMr* fl_mr = (struct FuseLinkMr*)mhandle;
-
   // Wait for the receiver to have posted the corresponding receive
   int nreqs = 0;
   volatile struct ncclIbSendFifo* slots;
@@ -1530,6 +1527,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
     comm->flushed = &sub->flushed;
     comm->transmitted = &sub->transmitted; // send to NIC
     comm->done = &sub->done; // send successfully
+    comm->nsteps = &sub->nsteps; // number of steps
     comm->request_addr = (uintptr_t) request;
   } 
   INFO(NCCL_INIT, "isend %p posted %d received %d flushed %d transmitted %d done %d", \
@@ -1580,7 +1578,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
     req->nreqs = nreqs;
     req->send.size = size;
     // convert data to fuselink address
-    INFO(NCCL_NET, "data %p, on dev %d, comm_dev %d", data, flmhdl->dev, comm->side_comm->verbs.dev);
+    INFO(NCCL_NET, "data %p, on dev %d, comm_dev %d base_addr %p regaddr %p", data, flmhdl->dev, comm->side_comm->verbs.dev, flmhdl->start_addr, flmhdl->flmr->addr[flmhdl->dev]);
     req->send.data = (void *) (flmhdl->flmr->addr[flmhdl->dev] + data - flmhdl->start_addr);
     // req->send.data = data;
     req->send.lkey = flmhdl->flmr->mr[flmhdl->dev][comm->side_comm->verbs.dev]->lkey;
@@ -1591,6 +1589,7 @@ ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mh
     req->flushed = comm->flushed;
     req->transmitted = comm->transmitted;
     req->done = comm->done;
+    req->nsteps = comm->nsteps;
     if (comm->side_comm->gidInfo.link_layer == IBV_LINK_LAYER_ETHERNET) req->gidInfo = &comm->side_comm->gidInfo;
     *request = reqs[r] = req;
 
@@ -1683,10 +1682,31 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
   if (comm->ready == 0) { *request = NULL; return ncclSuccess; }
   if (n > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
 
+  // need to hack upper layer info
+  if (get_addr_abs((uintptr_t) request, comm->request_addr) > UPDATE_HACKING_THRESHOLD) {
+    struct ncclProxySubArgsForHacking* sub = (struct ncclProxySubArgsForHacking*) \
+     ((uintptr_t) request - offsetof(struct ncclProxySubArgsForHacking, requests));
+    comm->posted = &sub->posted;
+    comm->received = &sub->received;
+    comm->flushed = &sub->flushed;
+    comm->transmitted = &sub->transmitted;
+    comm->done = &sub->done;
+    comm->request_addr = (uintptr_t) request;
+    comm->nsteps = &sub->nsteps;
+  }
+  // INFO(NCCL_INIT, "ncclIbIrecv: posted %d received %d flushed %d transmitted %d done %d nsteps %d",
+  //   *comm->posted, *comm->received, *comm->flushed, *comm->transmitted, *comm->done, *comm->nsteps);
 
   if (comm->n_finished % N_FINISHED_BATCH == 0) {
     // update side comm
     // INFO(NCCL_INIT, "UPDATING %p", fuselink_conn_manager);
+    // make sure that all recved data has been consumed by the upper layer
+    if (*(comm->received) == *(comm->done)) {
+      INFO(NCCL_INIT, "ncclIbIrecv: all recved data has been consumed by the upper layer");
+    } else {
+      INFO(NCCL_INIT, "ncclIbIrecv: recved %d done %d", *(comm->received), *(comm->done));
+      return ncclSuccess;
+    }
     comm->side_comm = (ncclIbRecvComm *) fuselink_conn_manager->refreshRxComm(comm->channelId, comm->txAvailable, ncclNIbDevs, &comm->fuselink_offset);
     INFO(NCCL_INIT, "ncclIbIrecv: update side comm %p, channelId %d, fuselink_offset %d", comm->side_comm, comm->channelId, comm->fuselink_offset);
   }
@@ -1725,17 +1745,7 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
   req->events = nqps;
 
   *request = req;
-  // need to hack upper layer info
-  if (get_addr_abs((uintptr_t) request, comm->request_addr) > UPDATE_HACKING_THRESHOLD) {
-    struct ncclProxySubArgsForHacking* sub = (struct ncclProxySubArgsForHacking*) \
-     ((uintptr_t) request - offsetof(struct ncclProxySubArgsForHacking, requests));
-    comm->posted = &sub->posted;
-    comm->received = &sub->received;
-    comm->flushed = &sub->flushed;
-    comm->transmitted = &sub->transmitted;
-    comm->done = &sub->done;
-    comm->request_addr = (uintptr_t) request;
-  }
+  
   INFO(NCCL_INIT, "recv %p posted %d received %d flushed %d transmitted %d done %d", \
      comm->posted, *comm->posted, *comm->received, *comm->flushed, *comm->transmitted, *comm->done);
   
@@ -1744,6 +1754,7 @@ ncclResult_t ncclIbIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
   req->flushed = comm->flushed;
   req->transmitted = comm->transmitted;
   req->done = comm->done;
+  req->nsteps = comm->nsteps;
 
   // Post to FIFO to notify sender
   TIME_START(2);
@@ -1790,7 +1801,8 @@ ncclResult_t ncclIbIflush(void* recvComm, int n, void** data, int* sizes, void**
 ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
   struct ncclIbRequest *r = (struct ncclIbRequest*)request;
   *done = 0;
-
+  // INFO(NCCL_INIT, "test posted %d received %d flushed %d transmitted %d done %d nsteps %d",
+  //   *r->posted, *r->received, *r->flushed, *r->transmitted, *r->done, *r->nsteps);
   while (1) {
     if (r->events == 0) {
       *done = 1;
@@ -1820,8 +1832,8 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
     }
     if (wrDone1 == 0 && wrDone2 == 0) { TIME_CANCEL(3); } else { TIME_STOP(3); }
     if (wrDone1 == 0 && wrDone2 == 0) return ncclSuccess;
-    INFO(NCCL_INIT|NCCL_NET, "poll cq on dev %d type %d", r->verbs->dev, r->type);
-    INFO(NCCL_INIT|NCCL_NET, "wrDone1 %d wrDone2 %d", wrDone1, wrDone2);
+    // INFO(NCCL_INIT|NCCL_NET, "poll cq on dev %d type %d", r->verbs->dev, r->type);
+    // INFO(NCCL_INIT|NCCL_NET, "wrDone1 %d wrDone2 %d", wrDone1, wrDone2);
     for (int w=0; w<wrDone1; w++) {
       struct ibv_wc *wc = wcs1+w;
       if (wc->status != IBV_WC_SUCCESS) {
