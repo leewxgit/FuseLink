@@ -1,6 +1,7 @@
 [submodule "nccl"]
 	path = nccl
 	url = https://github.com/NVIDIA/nccl.git
-[submodule "herald"]
+
+[submodule "experiments/dlrm"]
 	path = experiments/dlrm
 	url = https://github.com/HKUST-SING/herald.git
