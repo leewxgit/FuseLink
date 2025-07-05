@@ -8,3 +8,6 @@
 [submodule "experiments/serving/SwiftTransformer"]
 	path = experiments/serving/SwiftTransformer
 	url = https://github.com/LLMServe/SwiftTransformer.git
+[submodule "experiments/ep/Megatron-DeepSpeed"]
+	path = experiments/ep/Megatron-DeepSpeed
+	url = https://github.com/deepspeedai/Megatron-DeepSpeed.git
