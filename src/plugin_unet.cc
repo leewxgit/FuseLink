@@ -498,13 +498,13 @@
  struct ncclIbSendComm {
    struct ncclIbVerbs verbs;
    struct ncclIbSendFifo fifo[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
+   int channelId;
    uint64_t fifoHead;
    struct ncclIbRequest* fifoReqs[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
    struct ibv_send_wr wrs[NCCL_NET_IB_MAX_RECVS+1];
    struct ibv_sge sges[NCCL_NET_IB_MAX_RECVS];
    struct ncclSocket sock;
  
-   int channelId;
    ncclIbSendComm* side_comm;
  
    int ready;
@@ -553,6 +553,7 @@
  struct ncclIbRecvComm {
    struct ncclIbVerbs verbs;
    struct ncclIbRemFifo remFifo;
+   int channelId;
    struct ncclSocket sock;
    int ready;
    struct ibv_qp* qps[NCCL_IB_MAX_QPS];
@@ -561,7 +562,6 @@
    struct ncclIbGpuFlush gpuFlush;
    struct ncclIbGidInfo gidInfo;
  
-   int channelId;
    ncclIbRecvComm* side_comm;
    uint32_t txAvailable; // a mask indicating tx nic availability.
    int64_t n_finished;
@@ -722,44 +722,52 @@
    struct ncclIbHandle* handle = (struct ncclIbHandle*) opaqueHandle;
    struct ncclIbCommStage* stage = &handle->stage;
    int channelId = handle->channelId;
-   // INFO(NCCL_INIT|NCCL_NET, "NET/FuseLink : thread %p Using channel %d for connection", pthread_self(), handle->channelId);
+   // INFO(NCCL_INIT|NCCL_NET, "NET/Unet : thread %p Using channel %d for connection", pthread_self(), handle->channelId);
  
-   if (channelId == 0 && unet_conn_manager->tx_setup_state_ == UnetConnSetupStateInit) { // Unet TODO: build mirror comms
-     // init fuselink connections
-     // INFO(NCCL_INIT|NCCL_NET, "init fuselink connections TX");
-     unet_conn_manager->tx_setup_state_ = UnetConnSetupStatePending;
-     for (uint i = unet_conn_manager->GetTxNum(); i < ncclNIbDevs; i++) {
-       // if (i == dev) {
-       //   fuselink_conn_manager->PushTxSendComm(NULL);
-       //   continue;
-       // }
-       void* tmpSendComm = NULL;
-       // INFO(NCCL_INIT|NCCL_NET, "connecting # %d", i);
-       ncclIbConnect(i, handle, &tmpSendComm, NULL);
-       if (tmpSendComm != NULL) {
-         // unet init from this sendcomm
-         unet_conn_manager->PushTxSendComm(tmpSendComm);
-       } else {
-         *sendComm = NULL;
-         unet_conn_manager->tx_setup_state_ = UnetConnSetupStateInit;
-         return ncclSuccess; // non-blocking
-       }
-     }
-     // Unet TODO: build side comms, for each src NIC i with dst NIC (lComm->dev)
+   if (channelId == 0 && unet_conn_manager->tx_setup_state_ == UnetConnSetupStateInit) {
+      // init unet connections
+      // INFO(NCCL_INIT|NCCL_NET, "NET/Unet : init unet connections TX");
+      unet_conn_manager->tx_setup_state_ = UnetConnSetupStatePending;
+      // Unet: build mirror comms, for each src NIC i with dst NIC i
+      for (uint i = unet_conn_manager->GetMirrorTxNum(); i < ncclNIbDevs; i++) {
+        void* tmpSendComm = NULL;
+        // INFO(NCCL_INIT|NCCL_NET, "NET/Unet : mirror comm connecting # %d", i);
+        ncclIbConnect(i, handle, &tmpSendComm, NULL);
+        if (tmpSendComm != NULL) {
+          // unet successfully inits this mirror sendcomm
+          unet_conn_manager->PushMirrorTxSendComm(tmpSendComm);
+        } else {
+          *sendComm = NULL;
+          unet_conn_manager->tx_setup_state_ = UnetConnSetupStateInit;
+          return ncclSuccess; // non-blocking
+        }
+      }
+      // Unet: build side comms, for each src NIC i with dst NIC (dev)
+      for (uint i = unet_conn_manager->GetTxNum(); i < ncclNIbDevs; i++) {
+        void* tmpSendComm = NULL;
+        // INFO(NCCL_INIT|NCCL_NET, "NET/Unet : side comm connecting # %d", i);
+        ncclIbConnect(i, handle, &tmpSendComm, NULL);
+        if (tmpSendComm != NULL) {
+          // unet successfully inits this side sendcomm
+          unet_conn_manager->PushTxSendComm(tmpSendComm);
+        } else {
+          *sendComm = NULL;
+          unet_conn_manager->tx_setup_state_ = UnetConnSetupStateInit;
+          return ncclSuccess; // non-blocking
+        }
+      }
+      // Unet TODO: prepare side and mirror qp info mapping table and send to switch
 
 
-     // Unet
-
-    // Unet TODO: prepare side and mirror qp info mapping table and send to switch
-
-
-
-    // Unet
-     unet_conn_manager->tx_setup_state_ = UnetConnSetupStateReady;
-     for (uint i = 0; i < unet_conn_manager->tx_send_comms_.size(); i++) {
-       ncclIbSendComm* comm = (ncclIbSendComm*)(unet_conn_manager->tx_send_comms_[i]);
-       INFO(NCCL_INIT|NCCL_NET, "unet tx comm %p dev %d qpn %d", comm, comm->verbs.dev, comm->qps[0]->qp_num);
-     }
+      unet_conn_manager->tx_setup_state_ = UnetConnSetupStateReady;
+      for (uint i = 0; i < unet_conn_manager->tx_send_comms_.size(); i++) {
+        ncclIbSendComm* comm = (ncclIbSendComm*)(unet_conn_manager->tx_send_comms_[i]);
+        INFO(NCCL_INIT|NCCL_NET, "unet side tx comm %p dev %d qpn %d", comm, comm->verbs.dev, comm->qps[0]->qp_num);
+      }
+      for (uint i = 0; i < unet_conn_manager->mirror_tx_send_comms_.size(); i++) {
+        ncclIbSendComm* comm = (ncclIbSendComm*)(unet_conn_manager->mirror_tx_send_comms_[i]);
+        INFO(NCCL_INIT|NCCL_NET, "unet mirror tx comm %p dev %d qpn %d", comm, comm->verbs.dev, comm->qps[0]->qp_num);
+      }
    }
  
    struct ncclIbSendComm* comm = (struct ncclIbSendComm*)stage->comm;
@@ -908,11 +916,8 @@
    if (lComm->channelId == 0 && unet_conn_manager->rx_setup_state_ == UnetConnSetupStateInit) {
      // INFO(NCCL_INIT|NCCL_NET, "init unet connections RX");
      unet_conn_manager->rx_setup_state_ = UnetConnSetupStatePending;
-     for (uint i = unet_conn_manager->GetRxNum(); i < ncclNIbDevs; i++) { // Unet TODO: build mirror comms
-       // if (i == lComm->dev) {
-       //   unet_conn_manager->PushRxRecvComm(NULL);
-       //   continue;
-       // }
+     // Unet: build mirror comms, for each src NIC i with dst NIC i
+     for (uint i = unet_conn_manager->GetMirrorRxNum(); i < ncclNIbDevs; i++) {
        void* tmpRecvComm = NULL;
        // INFO(NCCL_INIT|NCCL_NET, "accepting # %d", i);
        int tmp_dev = lComm->dev;
@@ -920,22 +925,35 @@
        ncclIbAccept(listenComm, &tmpRecvComm, NULL);
        lComm->dev = tmp_dev;
        if (tmpRecvComm != NULL) {
-         // unet init from this recvcomm
+         // unet successfully inits this mirror recvcomm
+         unet_conn_manager->PushMirrorRxRecvComm(tmpRecvComm);
+       } else {
+         unet_conn_manager->rx_setup_state_ = UnetConnSetupStateInit;
+         return ncclSuccess; // non-blocking
+       }
+     }
+     // Unet: build side comms, for each src NIC i with dst NIC (lComm->dev)
+     for (uint i = unet_conn_manager->GetRxNum(); i < ncclNIbDevs; i++) {
+       void* tmpRecvComm = NULL;
+       // INFO(NCCL_INIT|NCCL_NET, "accepting # %d", i);
+       ncclIbAccept(listenComm, &tmpRecvComm, NULL);
+       if (tmpRecvComm != NULL) {
+         // unet successfully inits this side recvcomm
          unet_conn_manager->PushRxRecvComm(tmpRecvComm);
        } else {
          unet_conn_manager->rx_setup_state_ = UnetConnSetupStateInit;
          return ncclSuccess; // non-blocking
        }
      }
-     // Unet TODO: build side comms, for each src NIC i with dst NIC (lComm->dev)
-
-
-     // Unet
 
      unet_conn_manager->rx_setup_state_ = UnetConnSetupStateReady;
      for (uint i = 0; i < ncclNIbDevs; i++) {
        ncclIbRecvComm* comm = (ncclIbRecvComm*)(unet_conn_manager->rx_recv_comms_[i]);
        INFO(NCCL_INIT|NCCL_NET, "unet rx comm %p ldev %d rdev %d qpn %d", comm, lComm->dev, comm->verbs.dev, comm->qps[0]->qp_num);
+     }
+     for (uint i = 0; i < unet_conn_manager->mirror_rx_recv_comms_.size(); i++) {
+       ncclIbRecvComm* comm = (ncclIbRecvComm*)(unet_conn_manager->mirror_rx_recv_comms_[i]);
+       INFO(NCCL_INIT|NCCL_NET, "unet mirror rx comm %p ldev %d rdev %d qpn %d", comm, lComm->dev, comm->verbs.dev, comm->qps[0]->qp_num);
      }
    }
  

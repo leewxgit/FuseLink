@@ -72,7 +72,7 @@ public:
     ndevs_ = ndevs;
     priority_dev_ = priority_dev;
   }
-  UnetConnManager(int ndevs, int priority_dev, int nchannels) {
+  UnetConnManager(int ndevs, int priority_dev, int nchannels) { // hasn't been used yet
     ndevs_ = ndevs;
     priority_dev_ = priority_dev;
     nchannels_ = nchannels;
@@ -128,6 +128,22 @@ public:
     return rx_recv_comms_.size();
   }
 
+  void PushMirrorTxSendComm(void* send_comm) {
+    mirror_tx_send_comms_.push_back(send_comm);
+  }
+  
+  int GetMirrorTxNum() {
+    return mirror_tx_send_comms_.size();
+  }
+  
+  void PushMirrorRxRecvComm(void* recv_comm) {
+    mirror_rx_recv_comms_.push_back(recv_comm);
+  }
+  
+  int GetMirrorRxNum() {
+    return mirror_rx_recv_comms_.size();
+  }
+
   bool MarkTxChannelActive(int channelId) {
     return MarkNicTxBusy(channel2dev(channelId), channelId);
   }
@@ -136,20 +152,20 @@ public:
     return MarkNicRxBusy(channel2dev(channelId), channelId);
   }
 
-  void* RefreshTxComm(int channelId) {
-    /*
-      this function is called by the channel to get a NIC for tx
-      each channel independently call this function, so this function should be implemented with thread safety
-    */
-    // if (channelId / 2 == 0) {
-    //   // main channel
-    //   return NULL;
-    // } else {
-    //   // side channel
-    //   return tx_send_comms_[channel2dev(channelId)];
-    // }
-    return NULL;
-  }
+  // void* RefreshTxComm(int channelId) {
+  //   /*
+  //     this function is called by the channel to get a NIC for tx
+  //     each channel independently call this function, so this function should be implemented with thread safety
+  //   */
+  //   // if (channelId / 2 == 0) {
+  //   //   // main channel
+  //   //   return NULL;
+  //   // } else {
+  //   //   // side channel
+  //   //   return tx_send_comms_[channel2dev(channelId)];
+  //   // }
+  //   return NULL;
+  // }
 
   void* bidTxChannel(int channelId, int txNicId) {
     // DEBUG: return NULL to enforce the use of comm itself
@@ -161,22 +177,22 @@ public:
     // return monitor_client_->bidTxChannel(group_id, offset);
   }
 
-  bool RefreshRxComm(int channelId) {
-    /* same as the tx version */
-    if (channelId / 2 == 0) {
-      return NULL;
-    } else {
-      return rx_recv_comms_[channel2dev(channelId)];
-    }
-  }
+  // bool RefreshRxComm(int channelId) {
+  //   /* same as the tx version */
+  //   if (channelId / 2 == 0) {
+  //     return NULL;
+  //   } else {
+  //     return rx_recv_comms_[channel2dev(channelId)];
+  //   }
+  // }
 
-  int RegisterMem(void* ptr, size_t size, void** handle) {
-    /*
-      register the memory on all devices, we need an array of mr, use on demand
-    */
-    // not implemented yet
-    return -1;
-  }
+  // int RegisterMem(void* ptr, size_t size, void** handle) {
+  //   /*
+  //     register the memory on all devices, we need an array of mr, use on demand
+  //   */
+  //   // not implemented yet
+  //   return -1;
+  // }
 
   void* channel2txcomm(int channelId) {
     int dev = channel2dev(channelId);
@@ -188,45 +204,45 @@ public:
     return rx_recv_comms_[dev];
   }
 
-  void* refreshTxComm(int channelId) {
-    // call monitorclient to get a new nic
-    int nic_id = txchannel2dev_[channelId];
-    int group_id = nic_id / NNIC_PER_GROUP;
-    int offset = nic_id % NNIC_PER_GROUP;
-    // todo: update idle nic tx arguments.
-    int dev = monitor_client_->getIdleNicTx(group_id, priority_dev_);
-    txchannel2dev_[channelId] = dev;
-    return tx_send_comms_[dev];
-  }
+  // void* refreshTxComm(int channelId) {
+  //   // call monitorclient to get a new nic
+  //   int nic_id = txchannel2dev_[channelId];
+  //   int group_id = nic_id / NNIC_PER_GROUP;
+  //   int offset = nic_id % NNIC_PER_GROUP;
+  //   // todo: update idle nic tx arguments.
+  //   int dev = monitor_client_->getIdleNicTx(group_id, priority_dev_);
+  //   txchannel2dev_[channelId] = dev;
+  //   return tx_send_comms_[dev];
+  // }
 
-  void* refreshRxComm(int channelId) {
-    // call monitorclient to get a new nic
-    int group_id = channelId / NNIC_PER_GROUP;
-    int offset = channelId % NNIC_PER_GROUP;
-    int dev = monitor_client_->getIdleNicRx(group_id, priority_dev_, 0xffffffff);
-    rxchannel2dev_[channelId] = dev;
-    return rx_recv_comms_[dev];
-  }
+  // void* refreshRxComm(int channelId) {
+  //   // call monitorclient to get a new nic
+  //   int group_id = channelId / NNIC_PER_GROUP;
+  //   int offset = channelId % NNIC_PER_GROUP;
+  //   int dev = monitor_client_->getIdleNicRx(group_id, priority_dev_, 0xffffffff);
+  //   rxchannel2dev_[channelId] = dev;
+  //   return rx_recv_comms_[dev];
+  // }
 
-  void* refreshRxComm(int channelId, int* txAvailable, int nNics) {
-    // call monitorclient to get a new nic
-    // convert txAvailable to mask
+  // void* refreshRxComm(int channelId, int* txAvailable, int nNics) {
+  //   // call monitorclient to get a new nic
+  //   // convert txAvailable to mask
 
-    // DEBUG: return NULL to enforce the use of the comm itself
-    return NULL;
-    // DEBUG: end
+  //   // DEBUG: return NULL to enforce the use of the comm itself
+  //   return NULL;
+  //   // DEBUG: end
 
-    int mask = 0;
-    for (int i = 0; i < nNics; ++i) {
-      if (txAvailable[i]) {
-        mask |= (1 << i);
-      }
-    }
-    int group_id = rxchannel2dev_[channelId] / NNIC_PER_GROUP;
-    int dev = monitor_client_->getIdleNicRx(group_id, priority_dev_, mask);
-    rxchannel2dev_[channelId] = dev;
-    return rx_recv_comms_[dev];
-  }
+  //   int mask = 0;
+  //   for (int i = 0; i < nNics; ++i) {
+  //     if (txAvailable[i]) {
+  //       mask |= (1 << i);
+  //     }
+  //   }
+  //   int group_id = rxchannel2dev_[channelId] / NNIC_PER_GROUP;
+  //   int dev = monitor_client_->getIdleNicRx(group_id, priority_dev_, mask);
+  //   rxchannel2dev_[channelId] = dev;
+  //   return rx_recv_comms_[dev];
+  // }
 
   void* refreshRxComm(int channelId, uint32_t txAvailable, int nNics, int* fuselink_offset) {
     // call monitorclient to get a new nic
@@ -271,6 +287,8 @@ public:
   UnetConnSetupState rx_setup_state_;
   std::vector<void*> tx_send_comms_; // actually tx channels
   std::vector<void*> rx_recv_comms_; // actually rx channels
+  std::vector<void*> mirror_tx_send_comms_; // mirror tx comms
+  std::vector<void*> mirror_rx_recv_comms_; // mirror rx comms
 private:
 
   bool MarkNicTxBusy(int dev, int channelId) {
