@@ -1447,12 +1447,12 @@
    uint32_t immData = 0;
    if (nreqs == 1) { // cached free NICs
      if ( (comm->n_finished + 1) % N_FINISHED_BATCH == 0) {
-       immData = fuselink_conn_manager->refreshTxUsage(); 
+       immData = unet_conn_manager->refreshTxUsage(); 
      } else {
-       immData = fuselink_conn_manager->getTxUsage(); // cached.
+       immData = unet_conn_manager->getTxUsage(); // cached.
      }
    } else {
-     WARN("NET/FuseLink: multi-send not allowed");
+     WARN("NET/UNet: multi-send not allowed");
      return ncclInternalError;
    }
  
@@ -1505,7 +1505,7 @@
  
  ncclResult_t ncclIbIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
    struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
-   if (comm->ready == 0) { WARN("NET/FuseLink: ncclIbIsend() called when comm->ready == 0"); return ncclInternalError; }
+   if (comm->ready == 0) { WARN("NET/UNet: ncclIbIsend() called when comm->ready == 0"); return ncclInternalError; }
    if (comm->ready == 0) { *request = NULL; return ncclSuccess; }
    // printf("size: %d\n", size);
  
@@ -1576,7 +1576,7 @@
      }
      struct ncclIbRequest* req;
      NCCLCHECK(ncclIbGetRequest(&comm->side_comm->verbs, &req));
-     struct FuseLinkMemHandle* flmhdl = (struct FuseLinkMemHandle*) mhandle;
+     struct UnetMemHandle* unmhdl = (struct UnetMemHandle*) mhandle;
      req->type = NCCL_NET_IB_REQ_SEND;
      req->ibComm = comm;
      req->verbs = &comm->side_comm->verbs;
@@ -1584,10 +1584,10 @@
      req->nreqs = nreqs;
      req->send.size = size;
      // convert data to fuselink address
-     INFO(NCCL_NET, "data %p, on dev %d, comm_dev %d base_addr %p regaddr %p", data, flmhdl->dev, comm->side_comm->verbs.dev, flmhdl->start_addr, flmhdl->flmr->addr[flmhdl->dev]);
-     req->send.data = (void *) (flmhdl->flmr->addr[flmhdl->dev] + data - flmhdl->start_addr);
+     INFO(NCCL_NET, "data %p, on dev %d, comm_dev %d base_addr %p regaddr %p", data, unmhdl->dev, comm->side_comm->verbs.dev, unmhdl->start_addr, unmhdl->unmr->addr[unmhdl->dev]);
+     req->send.data = (void *) (unmhdl->unmr->addr[unmhdl->dev] + data - unmhdl->start_addr);
      // req->send.data = data;
-     req->send.lkey = flmhdl->flmr->mr[flmhdl->dev][comm->side_comm->verbs.dev]->lkey;
+     req->send.lkey = unmhdl->unmr->mr[unmhdl->dev][comm->side_comm->verbs.dev]->lkey;
      req->send.offset = 0;
      req->events = ncclParamIbSplitDataOnQps() ? comm->side_comm->nqps : 1;
      req->posted = comm->posted;
@@ -1619,7 +1619,7 @@
    return ncclSuccess;
  }
  
- ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int* sizes, int* tags, void** mhandles, struct ncclIbRequest* req, int fuselink_offset) {
+ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int* sizes, int* tags, void** mhandles, struct ncclIbRequest* req, int unet_offset) {
    struct ibv_send_wr wr;
    memset(&wr, 0, sizeof(wr));
  
@@ -1627,16 +1627,16 @@
    struct ncclIbSendFifo* localElem = comm->remFifo.elems[slot];
  
    for (int i=0; i<n; i++) {
-     struct FuseLinkMemHandle* flmhdl = (struct FuseLinkMemHandle*) mhandles[i];
+     struct UnetMemHandle* unmhdl = (struct UnetMemHandle*) mhandles[i];
      // convert data to fuselink address
-     localElem[i].addr = (uint64_t) (flmhdl->flmr->addr[flmhdl->dev] + data[i] - flmhdl->start_addr);
-     struct ibv_mr* mr = flmhdl->flmr->mr[flmhdl->dev][comm->side_comm->verbs.dev];
+     localElem[i].addr = (uint64_t) (unmhdl->unmr->addr[unmhdl->dev] + data[i] - unmhdl->start_addr);
+     struct ibv_mr* mr = unmhdl->unmr->mr[unmhdl->dev][comm->side_comm->verbs.dev];
      localElem[i].rkey = mr->lkey;
      localElem[i].nreqs = n;
      localElem[i].size = sizes[i]; // Sanity/Debugging
      localElem[i].tag = tags[i];
      localElem[i].idx = comm->remFifo.fifoTail+1;
-     localElem[i].fuselink_offset = fuselink_offset;
+     localElem[i].unet_offset = unet_offset;
    }
  
    wr.wr.rdma.remote_addr = comm->remFifo.addr + slot*NCCL_NET_IB_MAX_RECVS*sizeof(struct ncclIbSendFifo);
@@ -1713,12 +1713,12 @@
        INFO(NCCL_INIT, "ncclIbIrecv: recved %d done %d", *(comm->received), *(comm->done));
        return ncclSuccess;
      }
-     comm->side_comm = (ncclIbRecvComm *) fuselink_conn_manager->refreshRxComm(comm->channelId, comm->txAvailable, ncclNIbDevs, &comm->fuselink_offset);
-     INFO(NCCL_INIT, "ncclIbIrecv: update side comm %p, channelId %d, fuselink_offset %d", comm->side_comm, comm->channelId, comm->fuselink_offset);
+     comm->side_comm = (ncclIbRecvComm *) unet_conn_manager->refreshRxComm(comm->channelId, comm->txAvailable, ncclNIbDevs, &comm->unet_offset);
+     INFO(NCCL_INIT, "ncclIbIrecv: update side comm %p, channelId %d, unet_offset %d", comm->side_comm, comm->channelId, comm->unet_offset);
    }
    if (comm->side_comm == NULL) {
      comm->side_comm = comm;
-     comm->fuselink_offset = -1;
+     comm->unet_offset = -1;
    }
    ncclIbRecvComm* data_comm = comm->side_comm;
  
@@ -1765,7 +1765,7 @@
    // Post to FIFO to notify sender
    TIME_START(2);
    // comm is actually the fifo_comm
-   NCCLCHECK(ncclIbPostFifo(comm, n, data, sizes, tags, mhandles, req, comm->fuselink_offset));
+   NCCLCHECK(ncclIbPostFifo(comm, n, data, sizes, tags, mhandles, req, comm->unet_offset));
    TIME_STOP(2);
  
    return ncclSuccess;
