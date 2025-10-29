@@ -756,9 +756,6 @@
           return ncclSuccess; // non-blocking
         }
       }
-      // Unet TODO: prepare side and mirror qp info mapping table and send to switch
-
-
       unet_conn_manager->tx_setup_state_ = UnetConnSetupStateReady;
       for (uint i = 0; i < unet_conn_manager->tx_send_comms_.size(); i++) {
         ncclIbSendComm* comm = (ncclIbSendComm*)(unet_conn_manager->tx_send_comms_[i]);
@@ -904,6 +901,13 @@
  
  NCCL_PARAM(IbGdrFlushDisable, "GDR_FLUSH_DISABLE", 1);
  
+ struct side_mirror_qp_info {
+  char side_ip[MAXNAMESIZE];
+  char mirror_ip[MAXNAMESIZE];
+  uint32_t side_qpn[NCCL_IB_MAX_QPS];
+  uint32_t mirror_qpn[NCCL_IB_MAX_QPS];
+ };
+
  ncclResult_t ncclIbAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle_t** /*recvDevComm*/) {
    struct ncclIbListenComm* lComm = (struct ncclIbListenComm*)listenComm;
    struct ncclIbCommStage* stage = &lComm->stage;
@@ -945,6 +949,31 @@
          return ncclSuccess; // non-blocking
        }
      }
+     //Unet: send the side and mirror qp infos to switch
+     // set up switch socket connection
+     if (connect(unet_conn_manager->switch_sock_fd_, (struct sockaddr*)&unet_conn_manager->switch_addr_, sizeof(unet_conn_manager->switch_addr_)) < 0) {
+      INFO(NCCL_INIT|NCCL_NET, "NET/Unet: Failed to connect to switch");
+      return ncclInternalError;
+    }
+    // send the qp info to switch
+    uint n_side_comms = unet_conn_manager->GetRxNum();
+    struct side_mirror_qp_info *side_mirror_qp_info = new struct side_mirror_qp_info[n_side_comms];
+    for (uint i = 0; i < n_side_comms; i++) {
+      ncclIbRecvComm* side_comm = (ncclIbRecvComm*)(unet_conn_manager->rx_recv_comms_[i]);
+      ncclIbRecvComm* mirror_comm = (ncclIbRecvComm*)(unet_conn_manager->mirror_rx_recv_comms_[i]);
+      strcpy(side_mirror_qp_info[i].side_ip, ncclIbDevs[side_comm->verbs.dev].devName);
+      strcpy(side_mirror_qp_info[i].mirror_ip, ncclIbDevs[mirror_comm->verbs.dev].devName);
+      for (int q=0; q<side_comm->nqps; q++) {
+        side_mirror_qp_info[i].side_qpn[q] = side_comm->qps[q]->qp_num;
+        side_mirror_qp_info[i].mirror_qpn[q] = mirror_comm->qps[q]->qp_num;
+      }
+    }
+    if (send(unet_conn_manager->switch_sock_fd_, side_mirror_qp_info, sizeof(struct side_mirror_qp_info) * n_side_comms, 0) < 0) {
+      INFO(NCCL_INIT|NCCL_NET, "NET/Unet: Failed to send side and mirror qp infos to switch");
+      delete[] side_mirror_qp_info;
+      return ncclInternalError;
+    }
+    INFO(NCCL_INIT|NCCL_NET, "NET/Unet: Sent %d side and mirror qp infos to switch", n_side_comms);
 
      unet_conn_manager->rx_setup_state_ = UnetConnSetupStateReady;
      for (uint i = 0; i < ncclNIbDevs; i++) {

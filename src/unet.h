@@ -71,6 +71,16 @@ public:
   UnetConnManager(int ndevs, int priority_dev) {
     ndevs_ = ndevs;
     priority_dev_ = priority_dev;
+    memset(&switch_addr_, 0, sizeof(switch_addr_));
+    switch_addr_.sin_family = AF_INET;
+    switch_addr_.sin_port = htons(12345);
+    switch_addr_.sin_addr.s_addr = inet_addr("192.168.1.100"); // change to the switch ip address
+    //create client socket
+    switch_sock_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (switch_sock_fd_ < 0) {
+      INFO(NCCL_INIT|NCCL_NET, "NET/Unet: Failed to create switch socket");
+      return ncclInternalError;
+    }
   }
   UnetConnManager(int ndevs, int priority_dev, int nchannels) { // hasn't been used yet
     ndevs_ = ndevs;
@@ -96,6 +106,7 @@ public:
     }
     // delete monitor
     delete monitor_client_;
+    close(switch_sock_fd_);
   }
   void SetUpMonitor() {
     monitor_client_ = new MonitorClient();
@@ -289,6 +300,8 @@ public:
   std::vector<void*> rx_recv_comms_; // actually rx channels
   std::vector<void*> mirror_tx_send_comms_; // mirror tx comms
   std::vector<void*> mirror_rx_recv_comms_; // mirror rx comms
+  struct sockaddr_in switch_addr_;// switch address
+  int switch_sock_fd_;// switch socket file descriptor
 private:
 
   bool MarkNicTxBusy(int dev, int channelId) {
