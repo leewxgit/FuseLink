@@ -5,7 +5,7 @@ NCCL_HOME:=./nccl
 NCCL_BUILD_DIR?=$(NCCL_HOME)/build
 NCCL_INC:=$(NCCL_HOME)/src/include
 NCCL_HEADER:=$(NCCL_BUILD_DIR)/include
-FL_SO:=libnccl-net-fuselink.so
+FL_SO:=libnccl-net-unet.so
 NVCC:=$(CUDA_HOME)/bin/nvcc
 CXX:=/usr/bin/g++
 INC:=$(CUDA_CFLAGS) -I$(NCCL_INC) -I$(NCCL_HEADER) -I$(CONDA_PREFIX)/include -Isrc/
@@ -18,8 +18,8 @@ CFLAGS:=-fPIC -O2 -Wno-deprecated-gpu-targets
 monitor: src/monitor_main.cpp src/monitor.cpp
 	g++ $(INC) -o monitor src/monitor_main.cpp src/monitor.cpp -lpthread -libverbs -lrt
 
-FLSRC:=src/plugin.cc \
-		src/fuselink.cc \
+FLSRC:=src/plugin_unet.cc \
+		src/unet.cc \
         nccl/src/misc/ibvwrap.cc \
 		nccl/src/misc/socket.cc \
 		nccl/src/misc/cudawrap.cc \
