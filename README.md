@@ -1,7 +1,8 @@
-# FuseLink
+# Unet
 
 Efficient GPU communication over multiple NICs.
 
+## Note: The following describes how to run Fuselink. Necessary modifications are required to run UNet.
 ## Build
 
 Hardware:
@@ -62,7 +63,10 @@ src
 ├── monitor_main.cpp        FuseLink monitors for NIC idleness
 ├── monitor.cpp
 ├── monitor.h
-└── plugin.cc               FuseLink integrations in NCCL
+├── plugin.cc               FuseLink integrations in NCCL
+├── unet.cc                     UNET memory structures
+├── unet.h                      
+├── plugin_unet.cc              UNET integrations in NCCL
 ```
 
 ## Note for OSDI Artifact

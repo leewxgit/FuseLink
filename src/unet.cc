@@ -37,8 +37,6 @@ void UnetMemRegionInit(int nGPUs, void* base_addr, size_t size, int src_dev, int
     // create address range
     FL_CUCHECK(cuMemAddressReserve(&unmr->addr[i], aligned_sz, 0, 0, 0));
     FL_CUCHECK(cuMemMap(unmr->addr[i], aligned_sz, 0, unmr->hdl[i], 0));
-
-    // TODO: may need to enable access to this memory region
   }
   CUmemGenericAllocationHandle origin_hdl;
   FL_CUCHECK(cuMemRetainAllocationHandle(&origin_hdl, base_addr));

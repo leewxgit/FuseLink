@@ -172,141 +172,146 @@
  }
  
  ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction) {
-   if (ncclParamIbDisable()) return ncclInternalError;
-   static int shownIbHcaEnv = 0;
-   if(wrap_ibv_symbols() != ncclSuccess) { return ncclInternalError; }
+  if (ncclParamIbDisable()) return ncclInternalError;
+  static int shownIbHcaEnv = 0;
+  if(wrap_ibv_symbols() != ncclSuccess) { return ncclInternalError; }
+
+  if (ncclNIbDevs == -1) {
+    pthread_mutex_lock(&ncclIbLock);
+    wrap_ibv_fork_init();
+    if (ncclNIbDevs == -1) {
+      ncclNIbDevs = 0;
+      if (ncclFindInterfaces(ncclIbIfName, &ncclIbIfAddr, MAX_IF_NAME_SIZE, 1) != 1) {
+        WARN("NET/Unet : No IP interface found.");
+        return ncclInternalError;
+      }
+
+      // Detect IB cards
+      int nIbDevs;
+      struct ibv_device** devices;
+
+      // Check if user defined which IB device:port to use
+      char* userIbEnv = getenv("NCCL_IB_HCA");
+      if (userIbEnv != NULL && shownIbHcaEnv++ == 0) INFO(NCCL_NET|NCCL_ENV, "NCCL_IB_HCA set to %s", userIbEnv);
+      struct netIf userIfs[MAX_IB_DEVS];
+      bool searchNot = userIbEnv && userIbEnv[0] == '^';
+      if (searchNot) userIbEnv++;
+      bool searchExact = userIbEnv && userIbEnv[0] == '=';
+      if (searchExact) userIbEnv++;
+      int nUserIfs = parseStringList(userIbEnv, userIfs, MAX_IB_DEVS);
+
+      if (ncclSuccess != wrap_ibv_get_device_list(&devices, &nIbDevs)) return ncclInternalError;
+
+      for (int d=0; d<nIbDevs && ncclNIbDevs<MAX_IB_DEVS; d++) {
+        struct ibv_context * context;
+        if (ncclSuccess != wrap_ibv_open_device(&context, devices[d]) || context == NULL) {
+          WARN("NET/Unet : Unable to open device %s", devices[d]->name);
+          continue;
+        }
+        int nPorts = 0;
+        struct ibv_device_attr devAttr;
+        memset(&devAttr, 0, sizeof(devAttr));
+        if (ncclSuccess != wrap_ibv_query_device(context, &devAttr)) {
+          WARN("NET/Unet : Unable to query device %s", devices[d]->name);
+          if (ncclSuccess != wrap_ibv_close_device(context)) { return ncclInternalError; }
+          continue;
+        }
+        for (int port = 1; port <= devAttr.phys_port_cnt; port++) {
+          struct ibv_port_attr portAttr;
+          if (ncclSuccess != wrap_ibv_query_port(context, port, &portAttr)) {
+            WARN("NET/Unet : Unable to query port %d", port);
+            continue;
+          }
+          if (portAttr.state != IBV_PORT_ACTIVE) continue;
+          if (portAttr.link_layer != IBV_LINK_LAYER_INFINIBAND
+              && portAttr.link_layer != IBV_LINK_LAYER_ETHERNET) continue;
+
+          // check against user specified HCAs/ports
+          if (! (matchIfList(devices[d]->name, port, userIfs, nUserIfs, searchExact) ^ searchNot)) {
+            continue;
+          }
+          TRACE(NCCL_INIT|NCCL_NET,"NET/Unet: [%d] %s:%d/%s ", d, devices[d]->name, port,
+              portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND ? "IB" : "RoCE");
+          pthread_mutex_init(&ncclIbDevs[ncclNIbDevs].lock, NULL);
+          ncclIbDevs[ncclNIbDevs].device = d;
+          ncclIbDevs[ncclNIbDevs].guid = devAttr.sys_image_guid;
+          ncclIbDevs[ncclNIbDevs].port = port;
+          ncclIbDevs[ncclNIbDevs].link = portAttr.link_layer;
+          ncclIbDevs[ncclNIbDevs].speed = ncclIbSpeed(portAttr.active_speed) * ncclIbWidth(portAttr.active_width);
+          ncclIbDevs[ncclNIbDevs].context = context;
+          ncclIbDevs[ncclNIbDevs].pdRefs = 0;
+          ncclIbDevs[ncclNIbDevs].pd = NULL;
+          strncpy(ncclIbDevs[ncclNIbDevs].devName, devices[d]->name, MAXNAMESIZE);
+          NCCLCHECK(ncclIbGetPciPath(ncclIbDevs[ncclNIbDevs].devName, &ncclIbDevs[ncclNIbDevs].pciPath, &ncclIbDevs[ncclNIbDevs].realPort));
+          ncclIbDevs[ncclNIbDevs].maxQp = devAttr.max_qp;
+          ncclIbDevs[ncclNIbDevs].mrCache.capacity = 0;
+          ncclIbDevs[ncclNIbDevs].mrCache.population = 0;
+          ncclIbDevs[ncclNIbDevs].mrCache.slots = NULL;
+
+          // Enable ADAPTIVE_ROUTING by default on IB networks
+          // But allow it to be overloaded by an env parameter
+          ncclIbDevs[ncclNIbDevs].ar = (portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND) ? 1 : 0;
+          if (ncclParamIbAdaptiveRouting() != -2) ncclIbDevs[ncclNIbDevs].ar = ncclParamIbAdaptiveRouting();
+
+          pthread_create(&ncclIbAsyncThread, NULL, ncclIbAsyncThreadMain, context);
+          ncclSetThreadName(ncclIbAsyncThread, "NCCL IbAsync %2d", ncclNIbDevs);
+          pthread_detach(ncclIbAsyncThread); // will not be pthread_join()'d
+          ncclNIbDevs++;
+          nPorts++;
+        }
+        if (nPorts == 0 && ncclSuccess != wrap_ibv_close_device(context)) { return ncclInternalError; }
+      }
+      if (nIbDevs && (ncclSuccess != wrap_ibv_free_device_list(devices))) { return ncclInternalError; };
+    }
+    if (ncclNIbDevs == 0) {
+      INFO(NCCL_INIT|NCCL_NET, "NET/Unet: No device found.");
+    } else {
+      char line[1024];
+      line[0] = '\0';
+      // Determine whether RELAXED_ORDERING is enabled and possible
+      for (int d=0; d<ncclNIbDevs; d++) {
+        snprintf(line+strlen(line), 1023-strlen(line), " [%d]%s:%d/%s", d, ncclIbDevs[d].devName,
+            ncclIbDevs[d].port, ncclIbDevs[d].link == IBV_LINK_LAYER_INFINIBAND ? "IB" : "RoCE");
+      }
+      line[1023] = '\0';
+      char addrline[SOCKET_NAME_MAXLEN+1];
+      INFO(NCCL_INIT|NCCL_NET, "NET/Unet: Using%s %s; OOB %s:%s", line, ncclIbRelaxedOrderingEnabled ? "[RO]" : "",
+          ncclIbIfName, ncclSocketToString(&ncclIbIfAddr, addrline));
+    }
+    pthread_mutex_unlock(&ncclIbLock);
+  }
+  int ndevs = ncclNIbDevs;
+  int priority_dev = ncclParamUnetPriorityDev();
+  unet_conn_manager = new UnetConnManager(ndevs, priority_dev);
+  unet_conn_manager->tx_setup_state_ = UnetConnSetupStateInit;
+  unet_conn_manager->rx_setup_state_ = UnetConnSetupStateInit;
+  // UNET: set up switch socket connection
+  if (connect(unet_conn_manager->switch_sock_fd_, (struct sockaddr*)&unet_conn_manager->switch_addr_, sizeof(unet_conn_manager->switch_addr_)) < 0) {
+    WARN("NET/Unet: Failed to connect to switch");
+    return ncclInternalError;
+  }
  
-   if (ncclNIbDevs == -1) {
-     pthread_mutex_lock(&ncclIbLock);
-     wrap_ibv_fork_init();
-     if (ncclNIbDevs == -1) {
-       ncclNIbDevs = 0;
-       if (ncclFindInterfaces(ncclIbIfName, &ncclIbIfAddr, MAX_IF_NAME_SIZE, 1) != 1) {
-         WARN("NET/Unet : No IP interface found.");
-         return ncclInternalError;
-       }
- 
-       // Detect IB cards
-       int nIbDevs;
-       struct ibv_device** devices;
- 
-       // Check if user defined which IB device:port to use
-       char* userIbEnv = getenv("NCCL_IB_HCA");
-       if (userIbEnv != NULL && shownIbHcaEnv++ == 0) INFO(NCCL_NET|NCCL_ENV, "NCCL_IB_HCA set to %s", userIbEnv);
-       struct netIf userIfs[MAX_IB_DEVS];
-       bool searchNot = userIbEnv && userIbEnv[0] == '^';
-       if (searchNot) userIbEnv++;
-       bool searchExact = userIbEnv && userIbEnv[0] == '=';
-       if (searchExact) userIbEnv++;
-       int nUserIfs = parseStringList(userIbEnv, userIfs, MAX_IB_DEVS);
- 
-       if (ncclSuccess != wrap_ibv_get_device_list(&devices, &nIbDevs)) return ncclInternalError;
- 
-       for (int d=0; d<nIbDevs && ncclNIbDevs<MAX_IB_DEVS; d++) {
-         struct ibv_context * context;
-         if (ncclSuccess != wrap_ibv_open_device(&context, devices[d]) || context == NULL) {
-           WARN("NET/Unet : Unable to open device %s", devices[d]->name);
-           continue;
-         }
-         int nPorts = 0;
-         struct ibv_device_attr devAttr;
-         memset(&devAttr, 0, sizeof(devAttr));
-         if (ncclSuccess != wrap_ibv_query_device(context, &devAttr)) {
-           WARN("NET/Unet : Unable to query device %s", devices[d]->name);
-           if (ncclSuccess != wrap_ibv_close_device(context)) { return ncclInternalError; }
-           continue;
-         }
-         for (int port = 1; port <= devAttr.phys_port_cnt; port++) {
-           struct ibv_port_attr portAttr;
-           if (ncclSuccess != wrap_ibv_query_port(context, port, &portAttr)) {
-             WARN("NET/Unet : Unable to query port %d", port);
-             continue;
-           }
-           if (portAttr.state != IBV_PORT_ACTIVE) continue;
-           if (portAttr.link_layer != IBV_LINK_LAYER_INFINIBAND
-               && portAttr.link_layer != IBV_LINK_LAYER_ETHERNET) continue;
- 
-           // check against user specified HCAs/ports
-           if (! (matchIfList(devices[d]->name, port, userIfs, nUserIfs, searchExact) ^ searchNot)) {
-             continue;
-           }
-           TRACE(NCCL_INIT|NCCL_NET,"NET/Unet: [%d] %s:%d/%s ", d, devices[d]->name, port,
-               portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND ? "IB" : "RoCE");
-           pthread_mutex_init(&ncclIbDevs[ncclNIbDevs].lock, NULL);
-           ncclIbDevs[ncclNIbDevs].device = d;
-           ncclIbDevs[ncclNIbDevs].guid = devAttr.sys_image_guid;
-           ncclIbDevs[ncclNIbDevs].port = port;
-           ncclIbDevs[ncclNIbDevs].link = portAttr.link_layer;
-           ncclIbDevs[ncclNIbDevs].speed = ncclIbSpeed(portAttr.active_speed) * ncclIbWidth(portAttr.active_width);
-           ncclIbDevs[ncclNIbDevs].context = context;
-           ncclIbDevs[ncclNIbDevs].pdRefs = 0;
-           ncclIbDevs[ncclNIbDevs].pd = NULL;
-           strncpy(ncclIbDevs[ncclNIbDevs].devName, devices[d]->name, MAXNAMESIZE);
-           NCCLCHECK(ncclIbGetPciPath(ncclIbDevs[ncclNIbDevs].devName, &ncclIbDevs[ncclNIbDevs].pciPath, &ncclIbDevs[ncclNIbDevs].realPort));
-           ncclIbDevs[ncclNIbDevs].maxQp = devAttr.max_qp;
-           ncclIbDevs[ncclNIbDevs].mrCache.capacity = 0;
-           ncclIbDevs[ncclNIbDevs].mrCache.population = 0;
-           ncclIbDevs[ncclNIbDevs].mrCache.slots = NULL;
- 
-           // Enable ADAPTIVE_ROUTING by default on IB networks
-           // But allow it to be overloaded by an env parameter
-           ncclIbDevs[ncclNIbDevs].ar = (portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND) ? 1 : 0;
-           if (ncclParamIbAdaptiveRouting() != -2) ncclIbDevs[ncclNIbDevs].ar = ncclParamIbAdaptiveRouting();
- 
-           pthread_create(&ncclIbAsyncThread, NULL, ncclIbAsyncThreadMain, context);
-           ncclSetThreadName(ncclIbAsyncThread, "NCCL IbAsync %2d", ncclNIbDevs);
-           pthread_detach(ncclIbAsyncThread); // will not be pthread_join()'d
-           ncclNIbDevs++;
-           nPorts++;
-         }
-         if (nPorts == 0 && ncclSuccess != wrap_ibv_close_device(context)) { return ncclInternalError; }
-       }
-       if (nIbDevs && (ncclSuccess != wrap_ibv_free_device_list(devices))) { return ncclInternalError; };
-     }
-     if (ncclNIbDevs == 0) {
-       INFO(NCCL_INIT|NCCL_NET, "NET/Unet: No device found.");
-     } else {
-       char line[1024];
-       line[0] = '\0';
-       // Determine whether RELAXED_ORDERING is enabled and possible
-       for (int d=0; d<ncclNIbDevs; d++) {
-         snprintf(line+strlen(line), 1023-strlen(line), " [%d]%s:%d/%s", d, ncclIbDevs[d].devName,
-             ncclIbDevs[d].port, ncclIbDevs[d].link == IBV_LINK_LAYER_INFINIBAND ? "IB" : "RoCE");
-       }
-       line[1023] = '\0';
-       char addrline[SOCKET_NAME_MAXLEN+1];
-       INFO(NCCL_INIT|NCCL_NET, "NET/Unet: Using%s %s; OOB %s:%s", line, ncclIbRelaxedOrderingEnabled ? "[RO]" : "",
-            ncclIbIfName, ncclSocketToString(&ncclIbIfAddr, addrline));
-     }
-     pthread_mutex_unlock(&ncclIbLock);
-   }
-   int ndevs = ncclNIbDevs;
-   int priority_dev = ncclParamUnetPriorityDev();
-   unet_conn_manager = new UnetConnManager(ndevs, priority_dev);
-   unet_conn_manager->tx_setup_state_ = UnetConnSetupStateInit;
-   unet_conn_manager->rx_setup_state_ = UnetConnSetupStateInit;
- 
-   // allocate pd for each ib device
-   for (int idev = 0; idev < ncclNIbDevs; idev++) {
-     if (0 == ncclIbDevs[idev].pdRefs++) {
-       ncclResult_t res;
-       NCCLCHECKGOTO(wrap_ibv_alloc_pd(&ncclIbDevs[idev].pd, ncclIbDevs[idev].context), res, failure);
-       if (0) {
-       failure:
-         pthread_mutex_unlock(&ncclIbDevs[idev].lock);
-         return res;
-       }
-     }
-   }
- 
-   char *warn_str = \
-    "\n\n=======================\nNET/Unet: init done\n\nUnet is in very early stage of development, use in caution.\n=======================";
- 
-   WARN("%s", warn_str);
- 
-   CUDACHECK(cudaGetDeviceCount(&NGPUs));
- 
-   return ncclSuccess;
+  // allocate pd for each ib device
+  for (int idev = 0; idev < ncclNIbDevs; idev++) {
+    if (0 == ncclIbDevs[idev].pdRefs++) {
+      ncclResult_t res;
+      NCCLCHECKGOTO(wrap_ibv_alloc_pd(&ncclIbDevs[idev].pd, ncclIbDevs[idev].context), res, failure);
+      if (0) {
+      failure:
+        pthread_mutex_unlock(&ncclIbDevs[idev].lock);
+        return res;
+      }
+    }
+  }
+
+  char *warn_str = \
+  "\n\n=======================\nNET/Unet: init done\n\nUnet is in very early stage of development, use in caution.\n=======================";
+
+  WARN("%s", warn_str);
+
+  CUDACHECK(cudaGetDeviceCount(&NGPUs));
+
+  return ncclSuccess;
  }
  
  ncclResult_t ncclIbDevices(int* ndev) {
@@ -491,14 +496,17 @@
    uint32_t nreqs;
    uint32_t tag;
    uint64_t idx;
+   uint64_t recv_req_offset;
    int unet_offset;
-   char padding[28]; // 32 bytes alignment
+   char padding[20]; // 32 bytes alignment
  };
  
  struct ncclIbSendComm {
    struct ncclIbVerbs verbs;
-   struct ncclIbSendFifo fifo[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
    int channelId;
+   int send_or_recv; // 0: send, 1: recv
+   int padding[6];
+   struct ncclIbSendFifo fifo[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
    uint64_t fifoHead;
    struct ncclIbRequest* fifoReqs[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
    struct ibv_send_wr wrs[NCCL_NET_IB_MAX_RECVS+1];
@@ -552,8 +560,9 @@
  
  struct ncclIbRecvComm {
    struct ncclIbVerbs verbs;
-   struct ncclIbRemFifo remFifo;
    int channelId;
+   int padding[7];
+   struct ncclIbRemFifo remFifo;
    struct ncclSocket sock;
    int ready;
    struct ibv_qp* qps[NCCL_IB_MAX_QPS];
@@ -725,10 +734,9 @@
    // INFO(NCCL_INIT|NCCL_NET, "NET/Unet : thread %p Using channel %d for connection", pthread_self(), handle->channelId);
  
    if (channelId == 0 && unet_conn_manager->tx_setup_state_ == UnetConnSetupStateInit) {
-      // init unet connections
       // INFO(NCCL_INIT|NCCL_NET, "NET/Unet : init unet connections TX");
       unet_conn_manager->tx_setup_state_ = UnetConnSetupStatePending;
-      // Unet: build mirror comms, for each src NIC i with dst NIC i
+      // Unet: build mirror comms, for each src NIC i and dst NIC i pair
       for (uint i = unet_conn_manager->GetMirrorTxNum(); i < ncclNIbDevs; i++) {
         void* tmpSendComm = NULL;
         // INFO(NCCL_INIT|NCCL_NET, "NET/Unet : mirror comm connecting # %d", i);
@@ -742,7 +750,7 @@
           return ncclSuccess; // non-blocking
         }
       }
-      // Unet: build side comms, for each src NIC i with dst NIC (dev)
+      // Unet: build side comms, for each src NIC i with the original dst NIC (i.e., the input: dev)
       for (uint i = unet_conn_manager->GetTxNum(); i < ncclNIbDevs; i++) {
         void* tmpSendComm = NULL;
         // INFO(NCCL_INIT|NCCL_NET, "NET/Unet : side comm connecting # %d", i);
@@ -901,11 +909,13 @@
  
  NCCL_PARAM(IbGdrFlushDisable, "GDR_FLUSH_DISABLE", 1);
  
+ #define NCCL_UNET_MAX_QPS_PER_COMM 4
+
  struct side_mirror_qp_info {
   char side_ip[MAXNAMESIZE];
   char mirror_ip[MAXNAMESIZE];
-  uint32_t side_qpn[NCCL_IB_MAX_QPS];
-  uint32_t mirror_qpn[NCCL_IB_MAX_QPS];
+  uint32_t side_qpn[NCCL_UNET_MAX_QPS_PER_COMM];
+  uint32_t mirror_qpn[NCCL_UNET_MAX_QPS_PER_COMM];
  };
 
  // 单个结构体的打印函数
@@ -1013,53 +1023,48 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
 }
 
  ncclResult_t ncclIbAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle_t** /*recvDevComm*/) {
-   struct ncclIbListenComm* lComm = (struct ncclIbListenComm*)listenComm;
-   struct ncclIbCommStage* stage = &lComm->stage;
-   struct ncclIbRecvComm* rComm = (struct ncclIbRecvComm*)stage->comm;
-   int ready;
-   *recvComm = NULL;
+  struct ncclIbListenComm* lComm = (struct ncclIbListenComm*)listenComm;
+  struct ncclIbCommStage* stage = &lComm->stage;
+  struct ncclIbRecvComm* rComm = (struct ncclIbRecvComm*)stage->comm;
+  int ready;
+  *recvComm = NULL;
+
+  // INFO(NCCL_INIT|NCCL_NET, "channel id %d unet state %d", lComm->channelId, unet_conn_manager->rx_setup_state_);
  
-   // INFO(NCCL_INIT|NCCL_NET, "channel id %d fuselink state %d", lComm->channelId, fuselink_conn_manager->rx_setup_state_);
- 
-   if (lComm->channelId == 0 && unet_conn_manager->rx_setup_state_ == UnetConnSetupStateInit) {
-     // INFO(NCCL_INIT|NCCL_NET, "init unet connections RX");
-     unet_conn_manager->rx_setup_state_ = UnetConnSetupStatePending;
-     // Unet: build mirror comms, for each src NIC i with dst NIC i
-     for (uint i = unet_conn_manager->GetMirrorRxNum(); i < ncclNIbDevs; i++) {
-       void* tmpRecvComm = NULL;
-       // INFO(NCCL_INIT|NCCL_NET, "accepting # %d", i);
-       int tmp_dev = lComm->dev;
-       lComm->dev = i;
-       ncclIbAccept(listenComm, &tmpRecvComm, NULL);
-       lComm->dev = tmp_dev;
-       if (tmpRecvComm != NULL) {
-         // unet successfully inits this mirror recvcomm
-         unet_conn_manager->PushMirrorRxRecvComm(tmpRecvComm);
-       } else {
-         unet_conn_manager->rx_setup_state_ = UnetConnSetupStateInit;
-         return ncclSuccess; // non-blocking
-       }
-     }
-     // Unet: build side comms, for each src NIC i with dst NIC (lComm->dev)
-     for (uint i = unet_conn_manager->GetRxNum(); i < ncclNIbDevs; i++) {
-       void* tmpRecvComm = NULL;
-       // INFO(NCCL_INIT|NCCL_NET, "accepting # %d", i);
-       ncclIbAccept(listenComm, &tmpRecvComm, NULL);
-       if (tmpRecvComm != NULL) {
-         // unet successfully inits this side recvcomm
-         unet_conn_manager->PushRxRecvComm(tmpRecvComm);
-       } else {
-         unet_conn_manager->rx_setup_state_ = UnetConnSetupStateInit;
-         return ncclSuccess; // non-blocking
-       }
-     }
-     //Unet: send the side and mirror qp infos to switch
-     // set up switch socket connection
-     if (connect(unet_conn_manager->switch_sock_fd_, (struct sockaddr*)&unet_conn_manager->switch_addr_, sizeof(unet_conn_manager->switch_addr_)) < 0) {
-      INFO(NCCL_INIT|NCCL_NET, "NET/Unet: Failed to connect to switch");
-      return ncclInternalError;
+  if (lComm->channelId == 0 && unet_conn_manager->rx_setup_state_ == UnetConnSetupStateInit) {
+    // INFO(NCCL_INIT|NCCL_NET, "init unet connections RX");
+    unet_conn_manager->rx_setup_state_ = UnetConnSetupStatePending;
+    // Unet: build mirror comms, for each src NIC i and dst NIC i pair
+    for (uint i = unet_conn_manager->GetMirrorRxNum(); i < ncclNIbDevs; i++) {
+      void* tmpRecvComm = NULL;
+      // INFO(NCCL_INIT|NCCL_NET, "accepting # %d", i);
+      int tmp_dev = lComm->dev;
+      lComm->dev = i;
+      ncclIbAccept(listenComm, &tmpRecvComm, NULL);
+      lComm->dev = tmp_dev;
+      if (tmpRecvComm != NULL) {
+        // unet successfully inits this mirror recvcomm
+        unet_conn_manager->PushMirrorRxRecvComm(tmpRecvComm);
+        unet_conn_manager->mirror_recv_wr_outstanding_.push_back(0);
+      } else {
+        unet_conn_manager->rx_setup_state_ = UnetConnSetupStateInit;
+        return ncclSuccess; // non-blocking
+      }
     }
-    // send the qp info to switch
+    // Unet: build side comms, for each src NIC i with the original dst NIC (i.e., the input: lComm->dev)
+    for (uint i = unet_conn_manager->GetRxNum(); i < ncclNIbDevs; i++) {
+      void* tmpRecvComm = NULL;
+      // INFO(NCCL_INIT|NCCL_NET, "accepting # %d", i);
+      ncclIbAccept(listenComm, &tmpRecvComm, NULL);
+      if (tmpRecvComm != NULL) {
+        // unet successfully inits this side recvcomm
+        unet_conn_manager->PushRxRecvComm(tmpRecvComm);
+      } else {
+        unet_conn_manager->rx_setup_state_ = UnetConnSetupStateInit;
+        return ncclSuccess; // non-blocking
+      }
+    }
+    // Unet: send the side and mirror qp infos to switch
     uint n_side_comms = unet_conn_manager->GetRxNum();
     struct side_mirror_qp_info *side_mirror_qp_info = new struct side_mirror_qp_info[n_side_comms];
     for (uint i = 0; i < n_side_comms; i++) {
@@ -1067,6 +1072,10 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
       ncclIbRecvComm* mirror_comm = (ncclIbRecvComm*)(unet_conn_manager->mirror_rx_recv_comms_[i]);
       strcpy(side_mirror_qp_info[i].side_ip, ncclIbDevs[side_comm->verbs.dev].devName);
       strcpy(side_mirror_qp_info[i].mirror_ip, ncclIbDevs[mirror_comm->verbs.dev].devName);
+      if (side_comm->nqps > NCCL_UNET_MAX_QPS_PER_COMM) {
+        WARN("NET/Unet: Side comm %p has more than %d QPs", side_comm, NCCL_UNET_MAX_QPS_PER_COMM);
+        return ncclInternalError;
+      }
       for (int q=0; q<side_comm->nqps; q++) {
         side_mirror_qp_info[i].side_qpn[q] = side_comm->qps[q]->qp_num;
         side_mirror_qp_info[i].mirror_qpn[q] = mirror_comm->qps[q]->qp_num;
@@ -1081,16 +1090,16 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
     }
     INFO(NCCL_INIT|NCCL_NET, "NET/Unet: Sent %d side and mirror qp infos to switch", n_side_comms);
 
-     unet_conn_manager->rx_setup_state_ = UnetConnSetupStateReady;
-     for (uint i = 0; i < ncclNIbDevs; i++) {
-       ncclIbRecvComm* comm = (ncclIbRecvComm*)(unet_conn_manager->rx_recv_comms_[i]);
-       INFO(NCCL_INIT|NCCL_NET, "unet rx comm %p ldev %d rdev %d qpn %d", comm, lComm->dev, comm->verbs.dev, comm->qps[0]->qp_num);
-     }
-     for (uint i = 0; i < unet_conn_manager->mirror_rx_recv_comms_.size(); i++) {
-       ncclIbRecvComm* comm = (ncclIbRecvComm*)(unet_conn_manager->mirror_rx_recv_comms_[i]);
-       INFO(NCCL_INIT|NCCL_NET, "unet mirror rx comm %p ldev %d rdev %d qpn %d", comm, lComm->dev, comm->verbs.dev, comm->qps[0]->qp_num);
-     }
-   }
+    unet_conn_manager->rx_setup_state_ = UnetConnSetupStateReady;
+    for (uint i = 0; i < ncclNIbDevs; i++) {
+      ncclIbRecvComm* comm = (ncclIbRecvComm*)(unet_conn_manager->rx_recv_comms_[i]);
+      INFO(NCCL_INIT|NCCL_NET, "unet rx comm %p ldev %d rdev %d qpn %d", comm, lComm->dev, comm->verbs.dev, comm->qps[0]->qp_num);
+    }
+    for (uint i = 0; i < unet_conn_manager->mirror_rx_recv_comms_.size(); i++) {
+      ncclIbRecvComm* comm = (ncclIbRecvComm*)(unet_conn_manager->mirror_rx_recv_comms_[i]);
+      INFO(NCCL_INIT|NCCL_NET, "unet mirror rx comm %p ldev %d rdev %d qpn %d", comm, lComm->dev, comm->verbs.dev, comm->qps[0]->qp_num);
+    }
+  }
  
    if (stage->state == ncclIbCommStateAccept) goto ib_accept_check;
    if (stage->state == ncclIbCommStateRecv) goto ib_recv;
@@ -1332,6 +1341,17 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
    return ncclSuccess;  
  }
  
+ // mapping from devname to integer
+ std::map<std::string, int> devname2gpuId_send = {{"mlx5_1", 0}, {"mlx5_5", 1}, {"mlx5_3", 2}, {"mlx5_7", 3}};
+ std::map<std::string, int> devname2gpuId_recv = {{"mlx5_1", 0}, {"mlx5_5", 1}, {"mlx5_3", 2}, {"mlx5_7", 3}};
+
+ struct origin_to_mirror_buffer_info {
+  char side_ip[MAXNAMESIZE];
+  char mirror_ip[MAXNAMESIZE];
+  uintptr_t origin_addr;
+  uintptr_t mirror_addr;
+ };
+
  /* DMA-BUF support */
  ncclResult_t ncclIbRegMrDmaBuf(void* comm, void* data, size_t size, int type, uint64_t offset, int fd, void** mhandle) {
    static_assert(offsetof(struct ncclIbSendComm, verbs) == offsetof(struct ncclIbRecvComm, verbs), "Send and recv comms must have verbs at the same offset");
@@ -1344,7 +1364,33 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
  
    struct ncclIbVerbs* verbs = (struct ncclIbVerbs*)comm;
    int* channelId = (int *) ((uintptr_t) comm + offsetof(struct ncclIbSendComm, channelId));
- 
+   // UNET: find the remapping gpu id
+   int* send_or_recv = (int *) ((uintptr_t) comm + offsetof(struct ncclIbSendComm, send_or_recv));
+   struct origin_to_mirror_buffer_info buffer_info = {0, 0, 0, 0};
+   int mirror_gpu_id = -1;
+   if (*send_or_recv == 0) {
+     // send comm
+     ncclIbSendComm* mirror_comm = (ncclIbSendComm*) unet_conn_manager->getMirrorSendComm(*channelId, ncclNIbDevs);
+     int dev = mirror_comm->verbs.dev;
+      mirror_gpu_id = devname2gpuId_send[ncclIbDevs[dev].devName];
+     if (mirror_gpu_id == -1) {
+       WARN("NET/Unet: Mirror comm dev %d name %s mirror_gpu_id is invalid", dev, ncclIbDevs[dev].devName);
+       return ncclInternalError;
+     }
+     INFO(NCCL_NET, "NET/Unet: Mirror comm dev %d name %s mirror_gpu_id %d channelId %d", dev, ncclIbDevs[dev].devName, mirror_gpu_id, *channelId);
+   } else {
+     // recv comm
+     ncclIbRecvComm* mirror_comm = (ncclIbRecvComm*) unet_conn_manager->getMirrorRxComm(*channelId, ncclNIbDevs);
+     int dev = mirror_comm->verbs.dev;
+     mirror_gpu_id = devname2gpuId_recv[ncclIbDevs[dev].devName];
+     if (mirror_gpu_id == -1) {
+       WARN("NET/Unet: Mirror comm dev %d name %s mirror_gpu_id is invalid", dev, ncclIbDevs[dev].devName);
+       return ncclInternalError;
+     }
+     INFO(NCCL_NET, "NET/Unet: Mirror comm dev %d name %s mirror_gpu_id %d channelId %d", dev, ncclIbDevs[dev].devName, mirror_gpu_id, *channelId);
+     strcpy(buffer_info.side_ip, ncclIbDevs[verbs->dev].devName);
+     strcpy(buffer_info.mirror_ip, ncclIbDevs[dev].devName);
+   }
  
    uintptr_t addr = (uintptr_t)data & -pageSize;
    size_t pages = ((uintptr_t)data + size - addr + pageSize-1)/pageSize;
@@ -1374,12 +1420,12 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
      base_addr = (void *) addr;
      base_size = pages * pageSize;
      gpu_id = MAX_GPU_NUM;
-     switch_gpu_id = MAX_GPU_NUM;
+     switch_gpu_id = MAX_GPU_NUM; // UNET: switch_gpu_id is unused in the following code
    }
  
    pthread_mutex_lock(&addr2unmr_lock);
  
-   if (addr2unmr.find(base_addr) != addr2unmr.end()) {
+   if (addr2unmr.find(base_addr) != addr2unmr.end()) { // UNET: this avoids duplicate registration of the same memory region
      UnetMemHandle *unmhdl = new UnetMemHandle();
      auto unmr = addr2unmr.at(base_addr);
      pthread_mutex_unlock(&addr2unmr_lock);
@@ -1398,12 +1444,25 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
    INFO(NCCL_NET, "Unet memregion CREATE done");
    unmhdl->unmr = unmr;
    unmhdl->start_addr = (uintptr_t) base_addr;
-   unmhdl->dev = gpu_id;
+   if (*send_or_recv == 1) { // recv comm
+    unmhdl->dev = gpu_id;
+   } else { // send comm
+    unmhdl->dev = mirror_gpu_id;
+   }
    INFO(NCCL_NET, "Unet memregion init");
    UnetMemRegionInit(NGPUs, base_addr, base_size, gpu_id, unmhdl->dev, unmr, type == NCCL_PTR_CUDA);
    INFO(NCCL_NET, "Unet memregion init done");
- 
- 
+   // UNET: notify switch the receiver-side buffer mapping relationship
+   if (*send_or_recv == 1) {
+     // recv comm
+     buffer_info.origin_addr = (uintptr_t) unmhdl->unmr->addr[unmhdl->dev];
+     buffer_info.mirror_addr = (uintptr_t) unmhdl->unmr->addr[mirror_gpu_id];
+     if (send(unet_conn_manager->switch_sock_fd_, &buffer_info, sizeof(struct origin_to_mirror_buffer_info), 0) < 0) {
+       WARN("NET/Unet: Failed to send origin to mirror buffer info to switch");
+       return ncclInternalError;
+     }
+     INFO(NCCL_NET, "NET/Unet: Sent origin to mirror buffer info to switch");
+   }
    // register memory on devices
    std::vector<int> dataDevs;
    if (type == NCCL_PTR_CUDA) {
@@ -1482,6 +1541,13 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
  
      }
    }
+
+   // UNET TODO: notify switch the buffer mapping relationship
+
+   
+
+
+   
    addr2unmr[base_addr] = unmr;
    pthread_mutex_unlock(&addr2unmr_lock);
  
@@ -1569,7 +1635,7 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
  NCCL_PARAM(IbSplitDataOnQps, "IB_SPLIT_DATA_ON_QPS", 1);
  
  ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
-   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
+   struct ncclIbRequest** reqs = comm->fifoReqs[slot]; // UNET: reqs (pointer to requests in data_comm->verbs->reqs) and fifo slots remain in the original comm
    volatile struct ncclIbSendFifo* slots = comm->fifo[slot];
    int nreqs = slots[0].nreqs;
    if (nreqs > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
@@ -1600,9 +1666,11 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
    uint32_t immData = 0;
    if (nreqs == 1) { // cached free NICs
      if ( (comm->n_finished + 1) % N_FINISHED_BATCH == 0) {
-       immData = unet_conn_manager->refreshTxUsage(); 
+      //  immData = unet_conn_manager->refreshTxUsage(); 
+      immData = slots[0].recv_req_offset;
      } else {
-       immData = unet_conn_manager->getTxUsage(); // cached.
+      //  immData = unet_conn_manager->getTxUsage(); // cached.
+      immData = slots[0].recv_req_offset;
      }
    } else {
      WARN("NET/UNet: multi-send not allowed");
@@ -1660,7 +1728,6 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
    struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
    if (comm->ready == 0) { WARN("NET/UNet: ncclIbIsend() called when comm->ready == 0"); return ncclInternalError; }
    if (comm->ready == 0) { *request = NULL; return ncclSuccess; }
-   // printf("size: %d\n", size);
  
    // Wait for the receiver to have posted the corresponding receive
    int nreqs = 0;
@@ -1693,8 +1760,8 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
      comm->posted, *comm->posted, *comm->received, *comm->flushed, *comm->transmitted, *comm->done);
    // ..
    // select the proper comm
-   INFO(NCCL_INIT|NCCL_NET, "unet_offset %d", slots[0].unet_offset);
-   int unet_offset = slots[0].unet_offset;
+   int unet_offset = slots[0].unet_offset; 
+   INFO(NCCL_INIT|NCCL_NET, "unet_offset %d", unet_offset);
    if (unet_offset == -1) {
      comm->side_comm = comm;
    } else {
@@ -1738,7 +1805,7 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
      req->send.size = size;
      // convert data to fuselink address
      INFO(NCCL_NET, "data %p, on dev %d, comm_dev %d base_addr %p regaddr %p", data, unmhdl->dev, comm->side_comm->verbs.dev, unmhdl->start_addr, unmhdl->unmr->addr[unmhdl->dev]);
-     req->send.data = (void *) (unmhdl->unmr->addr[unmhdl->dev] + data - unmhdl->start_addr);
+     req->send.data = (void *) (unmhdl->unmr->addr[unmhdl->dev] + data - unmhdl->start_addr); //UNET TODO: why is unmhdl-dev used here?
      // req->send.data = data;
      req->send.lkey = unmhdl->unmr->mr[unmhdl->dev][comm->side_comm->verbs.dev]->lkey;
      req->send.offset = 0;
@@ -1784,11 +1851,12 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
      // convert data to fuselink address
      localElem[i].addr = (uint64_t) (unmhdl->unmr->addr[unmhdl->dev] + data[i] - unmhdl->start_addr);
      struct ibv_mr* mr = unmhdl->unmr->mr[unmhdl->dev][comm->side_comm->verbs.dev];
-     localElem[i].rkey = mr->lkey;
+     localElem[i].rkey = mr->lkey; // UNET: shouldn't it be mr->rkey???
      localElem[i].nreqs = n;
      localElem[i].size = sizes[i]; // Sanity/Debugging
      localElem[i].tag = tags[i];
      localElem[i].idx = comm->remFifo.fifoTail+1;
+     localElem[i].recv_req_offset = req - comm->side_comm->verbs.reqs;
      localElem[i].unet_offset = unet_offset;
    }
  
@@ -1855,7 +1923,8 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
    }
    // INFO(NCCL_INIT, "ncclIbIrecv: posted %d received %d flushed %d transmitted %d done %d nsteps %d",
    //   *comm->posted, *comm->received, *comm->flushed, *comm->transmitted, *comm->done, *comm->nsteps);
- 
+   
+   ncclIbRecvComm* mirror_comm = NULL;
    if (comm->n_finished % N_FINISHED_BATCH == 0) {
      // update side comm
      // INFO(NCCL_INIT, "UPDATING %p", fuselink_conn_manager);
@@ -1866,20 +1935,21 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
        INFO(NCCL_INIT, "ncclIbIrecv: recved %d done %d", *(comm->received), *(comm->done));
        return ncclSuccess;
      }
-     comm->side_comm = (ncclIbRecvComm *) unet_conn_manager->refreshRxComm(comm->channelId, comm->txAvailable, ncclNIbDevs, &comm->unet_offset);
-     INFO(NCCL_INIT, "ncclIbIrecv: update side comm %p, channelId %d, unet_offset %d", comm->side_comm, comm->channelId, comm->unet_offset);
+     comm->side_comm = (ncclIbRecvComm *) unet_conn_manager->refreshRxComm(comm->channelId, comm->txAvailable, ncclNIbDevs, &comm->unet_offset); // UNET: always select side comm according to channelId
+     mirror_comm = (ncclIbRecvComm *) unet_conn_manager->getMirrorRxComm(comm->channelId, ncclNIbDevs);
+     INFO(NCCL_INIT, "ncclIbIrecv: update side comm %p, channelId %d, unet_offset %d, mirror comm %p", comm->side_comm, comm->channelId, comm->unet_offset, mirror_comm);
    }
    if (comm->side_comm == NULL) {
      comm->side_comm = comm;
      comm->unet_offset = -1;
    }
    ncclIbRecvComm* data_comm = comm->side_comm;
- 
+
    struct ncclIbRequest* req;
    NCCLCHECK(ncclIbGetRequest(&data_comm->verbs, &req));
    req->type = NCCL_NET_IB_REQ_RECV;
    req->ibComm = comm;
-   req->side_verbs = &comm->verbs;
+   req->side_verbs = &comm->verbs; // postfifo always uses primary_comm while recv uses data_comm
    req->nreqs = n;
    if (comm->gidInfo.link_layer == IBV_LINK_LAYER_ETHERNET) req->gidInfo = &comm->gidInfo;
    for (int i=0; i<n; i++) req->recv.sizes[i] = 0;
@@ -1899,6 +1969,15 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
      struct ibv_recv_wr* bad_wr;
      NCCLCHECK(wrap_ibv_post_recv(qp, &wr, &bad_wr));
      data_comm->qpIndex = (data_comm->qpIndex+1)%data_comm->nqps;
+   }
+   if (mirror_comm != NULL && unet_conn_manager->mirror_recv_wr_outstanding_[comm->channelId] < MAX_REQUESTS) { // UNET: post recv to mirror comm, prepared for ToR switch rerouting. We cannot post too many recv WRs.
+     for (int q=0; q<nqps; q++) {
+       struct ibv_qp* qp = mirror_comm->qps[mirror_comm->qpIndex];
+       struct ibv_recv_wr* bad_wr;
+       NCCLCHECK(wrap_ibv_post_recv(qp, &wr, &bad_wr));
+       mirror_comm->qpIndex = (mirror_comm->qpIndex+1)%mirror_comm->nqps;
+       unet_conn_manager->mirror_recv_wr_outstanding_[comm->channelId] += 1;
+     }
    }
    TIME_STOP(1);
    req->events = nqps;
@@ -1958,162 +2037,193 @@ char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer,
  }
  
  ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
-   struct ncclIbRequest *r = (struct ncclIbRequest*)request;
-   *done = 0;
-   // INFO(NCCL_INIT, "test posted %d received %d flushed %d transmitted %d done %d nsteps %d",
-   //   *r->posted, *r->received, *r->flushed, *r->transmitted, *r->done, *r->nsteps);
-   while (1) {
-     if (r->events == 0) {
-       *done = 1;
-       if (r->type == NCCL_NET_IB_REQ_SEND) {
-         struct ncclIbSendComm* comm = (struct ncclIbSendComm*)r->ibComm;
-         comm->n_finished++;
-         // todo: update nic activities.
-       }
-       if (r->type == NCCL_NET_IB_REQ_RECV) {
-         struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)r->ibComm;
-         comm->n_finished++;
-       }
-       if (sizes && r->type == NCCL_NET_IB_REQ_RECV) {
-         for (int i=0; i<r->nreqs; i++) sizes[i] = r->recv.sizes[i];
-       }
-       NCCLCHECK(ncclIbFreeRequest(r));
-       return ncclSuccess;
-     }
- 
-     int wrDone1 = 0, wrDone2 = 0;
-     struct ibv_wc wcs1[4], wcs2[4];
-     TIME_START(3);
-     // caution: r->verbs with qp must match
-     NCCLCHECK(wrap_ibv_poll_cq(r->verbs->cq, 4, wcs1, &wrDone1));
-     if (r->side_verbs) {
-       NCCLCHECK(wrap_ibv_poll_cq(r->side_verbs->cq, 4, wcs2, &wrDone2));
-     }
-     if (wrDone1 == 0 && wrDone2 == 0) { TIME_CANCEL(3); } else { TIME_STOP(3); }
-     if (wrDone1 == 0 && wrDone2 == 0) return ncclSuccess;
-     // INFO(NCCL_INIT|NCCL_NET, "poll cq on dev %d type %d", r->verbs->dev, r->type);
-     // INFO(NCCL_INIT|NCCL_NET, "wrDone1 %d wrDone2 %d", wrDone1, wrDone2);
-     for (int w=0; w<wrDone1; w++) {
-       struct ibv_wc *wc = wcs1+w;
-       if (wc->status != IBV_WC_SUCCESS) {
-         char line[SOCKET_NAME_MAXLEN+1];
-         union ncclSocketAddress addr;
-         // get comm->sock from r->ibComm
-         if (r->type == NCCL_NET_IB_REQ_SEND) {
-           struct ncclIbSendComm* comm = (struct ncclIbSendComm*)r->ibComm;
-           ncclSocketGetAddr(&comm->sock, &addr);
-         } else {
-           struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)r->ibComm;
-           ncclSocketGetAddr(&comm->sock, &addr);
-         }
-         char localGidString[INET6_ADDRSTRLEN] = "";
-         char remoteGidString[INET6_ADDRSTRLEN] = "";
-         const char* localGidStr = NULL, *remoteGidStr = NULL;
-         if (r->gidInfo) {
-             localGidStr = inet_ntop(AF_INET6, &r->gidInfo->localGid, localGidString, sizeof(localGidString));
-             remoteGidStr = inet_ntop(AF_INET6, &r->gidInfo->remoteGid, remoteGidString, sizeof(remoteGidString));
-         }
-         WARN("NET/FuseLink : Got completion from peer %s with error %d, wr_id %d, dev %d, comm %p, opcode %d, len %d, vendor err %d (%s)%s%s%s%s",
-             ncclSocketToString(&addr, line), wc->status, wc->wr_id, r->verbs->dev, r->ibComm, wc->opcode, wc->byte_len, wc->vendor_err, reqTypeStr[r->type],
-             localGidStr ?  " localGid ":"", localGidString, remoteGidStr ? " remoteGid ":"", remoteGidString);
-         return ncclRemoteError;
-       }
- 
-       struct ncclIbRequest* req = r->verbs->reqs+(wc->wr_id & 0xff);
-       if (req->type == NCCL_NET_IB_REQ_SEND) {
-         for (int i=0; i<req->nreqs; i++) {
-           struct ncclIbRequest* sendReq = r->verbs->reqs+((wc->wr_id >> (i*8)) & 0xff);
-           if ((sendReq->events <= 0)) return ncclInternalError;
-           sendReq->events--;
-         }
-       } else {
-         if (req && wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-           if (req->type != NCCL_NET_IB_REQ_RECV) return ncclInternalError;
-           if (req->nreqs > 1) {
-             // // In the case of a multi recv, we only set sizes to 0 or 1.
-             // for (int i=0; i<req->nreqs; i++) {
-             //   req->recv.sizes[i] = (wc->imm_data >> i) & 0x1;
-             // }
-             // not allowed
-             WARN("NET/FuseLink: multi recv not allowed");
-             return ncclInternalError;
-           } else {
-             // req->recv.sizes[0] += wc->imm_data;
-             // cache the imm_data as the mask
-             ncclIbRecvComm* comm = (ncclIbRecvComm*)req->ibComm;
-             comm->txAvailable = wc->imm_data;
-           }
-         }
-         req->events--;
-         INFO (NCCL_INIT|NCCL_NET, "req->type %d req->events %d", req->type, req->events);
-       }
-     }
-     for (int w=0; w<wrDone2; w++) {
-       struct ibv_wc *wc = wcs2+w;
-       if (wc->status != IBV_WC_SUCCESS) {
-         char line[SOCKET_NAME_MAXLEN+1];
-         union ncclSocketAddress addr;
-         // get comm->sock from r->ibComm
-         if (r->type == NCCL_NET_IB_REQ_SEND) {
-           struct ncclIbSendComm* comm = (struct ncclIbSendComm*)r->ibComm;
-           ncclSocketGetAddr(&comm->sock, &addr);
-         } else {
-           struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)r->ibComm;
-           ncclSocketGetAddr(&comm->sock, &addr);
-         }
-         char localGidString[INET6_ADDRSTRLEN] = "";
-         char remoteGidString[INET6_ADDRSTRLEN] = "";
-         const char* localGidStr = NULL, *remoteGidStr = NULL;
-         if (r->gidInfo) {
-             localGidStr = inet_ntop(AF_INET6, &r->gidInfo->localGid, localGidString, sizeof(localGidString));
-             remoteGidStr = inet_ntop(AF_INET6, &r->gidInfo->remoteGid, remoteGidString, sizeof(remoteGidString));
-         }
-         WARN("NET/FuseLink : Got completion from peer %s with error %d, wr_id %d, dev %d, comm %p, opcode %d, len %d, vendor err %d (%s)%s%s%s%s",
-             ncclSocketToString(&addr, line), wc->status, wc->wr_id, r->verbs->dev, r->ibComm, wc->opcode, wc->byte_len, wc->vendor_err, reqTypeStr[r->type],
-             localGidStr ?  " localGid ":"", localGidString, remoteGidStr ? " remoteGid ":"", remoteGidString);
-         return ncclRemoteError;
-       }
- 
-       struct ncclIbRequest* req = r->verbs->reqs+(wc->wr_id & 0xff);
-       if (req->type == NCCL_NET_IB_REQ_SEND) {
-         for (int i=0; i<req->nreqs; i++) {
-           struct ncclIbRequest* sendReq = r->verbs->reqs+((wc->wr_id >> (i*8)) & 0xff);
-           if ((sendReq->events <= 0)) return ncclInternalError;
-           sendReq->events--;
-         }
-       } else {
-         if (req && wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-           if (req->type != NCCL_NET_IB_REQ_RECV) return ncclInternalError;
-           if (req->nreqs > 1) {
-             // // In the case of a multi recv, we only set sizes to 0 or 1.
-             // for (int i=0; i<req->nreqs; i++) {
-             //   req->recv.sizes[i] = (wc->imm_data >> i) & 0x1;
-             // }
-             // not allowed
-             WARN("NET/FuseLink: multi recv not allowed");
-             return ncclInternalError;
-           } else {
-             // req->recv.sizes[0] += wc->imm_data;
-             // cache the imm_data as the mask
-             ncclIbRecvComm* comm = (ncclIbRecvComm*)req->ibComm;
-             comm->txAvailable = wc->imm_data;
-           }
-         }
-         req->events--;
-         INFO (NCCL_INIT|NCCL_NET, "req->type %d req->events %d", req->type, req->events);
-       }
-     }
-     
-   } // while 1
- 
-   // for sending, if we need to change path, we need to wait until all other sending requests in the buffer are done
-   // in addition, we need to make sure that the GPU is not writing to the buffer
- 
-   // for receiving, if we need to change path, all received data must be consumed
-   // and there should not be any outstanding receive requests
- }
- 
- ncclResult_t ncclIbCloseSend(void* sendComm) {
+    struct ncclIbRequest *r = (struct ncclIbRequest*)request;
+    *done = 0;
+    // INFO(NCCL_INIT, "test posted %d received %d flushed %d transmitted %d done %d nsteps %d",
+    //   *r->posted, *r->received, *r->flushed, *r->transmitted, *r->done, *r->nsteps);
+    while (1) {
+      if (r->events == 0) {
+        *done = 1;
+        if (r->type == NCCL_NET_IB_REQ_SEND) {
+          struct ncclIbSendComm* comm = (struct ncclIbSendComm*)r->ibComm;
+          comm->n_finished++;
+          // todo: update nic activities.
+        }
+        if (r->type == NCCL_NET_IB_REQ_RECV) {
+          struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)r->ibComm;
+          comm->n_finished++;
+        }
+        if (sizes && r->type == NCCL_NET_IB_REQ_RECV) {
+          for (int i=0; i<r->nreqs; i++) sizes[i] = r->recv.sizes[i];
+        }
+        NCCLCHECK(ncclIbFreeRequest(r));
+        return ncclSuccess;
+      }
+
+      int wrDone1 = 0, wrDone2 = 0;
+      struct ibv_wc wcs1[4], wcs2[4];
+      TIME_START(3);
+      // caution: r->verbs with qp must match
+      NCCLCHECK(wrap_ibv_poll_cq(r->verbs->cq, 4, wcs1, &wrDone1)); // UNET: for send and recv completion
+      if (r->side_verbs) { // UNET: for postfifo completion
+        NCCLCHECK(wrap_ibv_poll_cq(r->side_verbs->cq, 4, wcs2, &wrDone2));
+      }
+      if (wrDone1 == 0 && wrDone2 == 0) { TIME_CANCEL(3); } else { TIME_STOP(3); }
+      if (wrDone1 == 0 && wrDone2 == 0) return ncclSuccess;
+      // INFO(NCCL_INIT|NCCL_NET, "poll cq on dev %d type %d", r->verbs->dev, r->type);
+      // INFO(NCCL_INIT|NCCL_NET, "wrDone1 %d wrDone2 %d", wrDone1, wrDone2);
+      for (int w=0; w<wrDone1; w++) {
+        struct ibv_wc *wc = wcs1+w;
+        if (wc->status != IBV_WC_SUCCESS) {
+          char line[SOCKET_NAME_MAXLEN+1];
+          union ncclSocketAddress addr;
+          // get comm->sock from r->ibComm
+          if (r->type == NCCL_NET_IB_REQ_SEND) {
+            struct ncclIbSendComm* comm = (struct ncclIbSendComm*)r->ibComm;
+            ncclSocketGetAddr(&comm->sock, &addr);
+          } else {
+            struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)r->ibComm;
+            ncclSocketGetAddr(&comm->sock, &addr);
+          }
+          char localGidString[INET6_ADDRSTRLEN] = "";
+          char remoteGidString[INET6_ADDRSTRLEN] = "";
+          const char* localGidStr = NULL, *remoteGidStr = NULL;
+          if (r->gidInfo) {
+              localGidStr = inet_ntop(AF_INET6, &r->gidInfo->localGid, localGidString, sizeof(localGidString));
+              remoteGidStr = inet_ntop(AF_INET6, &r->gidInfo->remoteGid, remoteGidString, sizeof(remoteGidString));
+          }
+          WARN("NET/FuseLink : Got completion from peer %s with error %d, wr_id %d, dev %d, comm %p, opcode %d, len %d, vendor err %d (%s)%s%s%s%s",
+              ncclSocketToString(&addr, line), wc->status, wc->wr_id, r->verbs->dev, r->ibComm, wc->opcode, wc->byte_len, wc->vendor_err, reqTypeStr[r->type],
+              localGidStr ?  " localGid ":"", localGidString, remoteGidStr ? " remoteGid ":"", remoteGidString);
+          return ncclRemoteError;
+        }
+
+        struct ncclIbRequest* req = r->verbs->reqs+(wc->wr_id & 0xff); // UNET: currently it's ok for primary and side comm
+        if (req->type == NCCL_NET_IB_REQ_SEND) {
+          for (int i=0; i<req->nreqs; i++) {
+            struct ncclIbRequest* sendReq = r->verbs->reqs+((wc->wr_id >> (i*8)) & 0xff);
+            if ((sendReq->events <= 0)) return ncclInternalError;
+            sendReq->events--;
+          }
+        } else {
+          if (req && wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+            if (req->type != NCCL_NET_IB_REQ_RECV) return ncclInternalError;
+            if (req->nreqs > 1) {
+              // // In the case of a multi recv, we only set sizes to 0 or 1.
+              // for (int i=0; i<req->nreqs; i++) {
+              //   req->recv.sizes[i] = (wc->imm_data >> i) & 0x1;
+              // }
+              // not allowed
+              WARN("NET/UNET: multi recv not allowed");
+              return ncclInternalError;
+            } else {
+              // req->recv.sizes[0] += wc->imm_data;
+              // cache the imm_data as the mask
+              //  ncclIbRecvComm* comm = (ncclIbRecvComm*)req->ibComm;
+              //  comm->txAvailable = wc->imm_data;
+              // UNET TODO: check the mirror comm
+              ncclIbRecvComm* comm = (ncclIbRecvComm*)req->ibComm;
+              ncclIbRecvComm* mirror_comm = NULL;
+              mirror_comm = (ncclIbRecvComm *) unet_conn_manager->getMirrorRxComm(comm->channelId, ncclNIbDevs);
+              if (mirror_comm != NULL) {
+                int wrDoneMirror = 0;
+                struct ibv_wc wcsMirror[4];
+                TIME_START(3);
+                NCCLCHECK(wrap_ibv_poll_cq(mirror_comm->verbs.cq, 4, wcsMirror, &wrDoneMirror));
+                if (wrDoneMirror == 0) { 
+                  TIME_CANCEL(3); 
+                  INFO(NCCL_INIT|NCCL_NET, "mirror recv comm is empty");
+                } else { 
+                  TIME_STOP(3);
+                  for (int w=0; w<wrDoneMirror; w++) {
+                    struct ibv_wc *wc = wcsMirror+w;
+                    if (wc->status != IBV_WC_SUCCESS) {
+                      WARN("NET/UNET: Got completion from mirror comm with error %d, immdata %d, dev %d, comm %p, opcode %d, len %d, vendor err %d",
+                        wc->status, wc->imm_data, mirror_comm->verbs.dev, mirror_comm, wc->opcode, wc->byte_len, wc->vendor_err);
+                      return ncclRemoteError;
+                    }
+                    unet_conn_manager->mirror_recv_wr_outstanding_[comm->channelId] -= 1;
+                    struct ncclIbRequest* req = r->verbs->reqs+(wc->imm_data & 0xff);
+                    if (req->type != NCCL_NET_IB_REQ_RECV || wc->opcode != IBV_WC_RECV_RDMA_WITH_IMM) {
+                      WARN("NET/UNET: Got completion from mirror comm with invalid request type %d or opcode %d, immdata %d", req->type, wc->opcode, wc->imm_data);
+                      return ncclInternalError;
+                    }
+                    if (req->nreqs > 1) {
+                      WARN("NET/UNET: multi recv not allowed");
+                      return ncclInternalError;
+                    } else{
+                      INFO (NCCL_INIT|NCCL_NET, "NET/UNET: Got completion from mirror comm with immdata %d", wc->imm_data);
+                    }
+                  }
+                }
+              } else {
+                INFO(NCCL_INIT|NCCL_NET, "mirror recv comm is not available");
+              }
+            }
+            req->events--;
+            INFO (NCCL_INIT|NCCL_NET, "req->type %d req->events %d", req->type, req->events);
+          }
+        }
+      }
+      for (int w=0; w<wrDone2; w++) {
+        struct ibv_wc *wc = wcs2+w;
+        if (wc->status != IBV_WC_SUCCESS) {
+          char line[SOCKET_NAME_MAXLEN+1];
+          union ncclSocketAddress addr;
+          // get comm->sock from r->ibComm
+          if (r->type == NCCL_NET_IB_REQ_SEND) {
+            struct ncclIbSendComm* comm = (struct ncclIbSendComm*)r->ibComm;
+            ncclSocketGetAddr(&comm->sock, &addr);
+          } else {
+            struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)r->ibComm;
+            ncclSocketGetAddr(&comm->sock, &addr);
+          }
+          char localGidString[INET6_ADDRSTRLEN] = "";
+          char remoteGidString[INET6_ADDRSTRLEN] = "";
+          const char* localGidStr = NULL, *remoteGidStr = NULL;
+          if (r->gidInfo) {
+              localGidStr = inet_ntop(AF_INET6, &r->gidInfo->localGid, localGidString, sizeof(localGidString));
+              remoteGidStr = inet_ntop(AF_INET6, &r->gidInfo->remoteGid, remoteGidString, sizeof(remoteGidString));
+          }
+          WARN("NET/FuseLink : Got completion from peer %s with error %d, wr_id %d, dev %d, comm %p, opcode %d, len %d, vendor err %d (%s)%s%s%s%s",
+              ncclSocketToString(&addr, line), wc->status, wc->wr_id, r->verbs->dev, r->ibComm, wc->opcode, wc->byte_len, wc->vendor_err, reqTypeStr[r->type],
+              localGidStr ?  " localGid ":"", localGidString, remoteGidStr ? " remoteGid ":"", remoteGidString);
+          return ncclRemoteError;
+        }
+
+        struct ncclIbRequest* req = r->verbs->reqs+(wc->wr_id & 0xff);
+        if (req->type == NCCL_NET_IB_REQ_SEND) {
+          for (int i=0; i<req->nreqs; i++) {
+            struct ncclIbRequest* sendReq = r->verbs->reqs+((wc->wr_id >> (i*8)) & 0xff);
+            if ((sendReq->events <= 0)) return ncclInternalError;
+            sendReq->events--;
+          }
+        } else {
+          if (req && wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+            if (req->type != NCCL_NET_IB_REQ_RECV) return ncclInternalError;
+            if (req->nreqs > 1) {
+              // // In the case of a multi recv, we only set sizes to 0 or 1.
+              // for (int i=0; i<req->nreqs; i++) {
+              //   req->recv.sizes[i] = (wc->imm_data >> i) & 0x1;
+              // }
+              // not allowed
+              WARN("NET/FuseLink: multi recv not allowed");
+              return ncclInternalError;
+            } else {
+              // req->recv.sizes[0] += wc->imm_data;
+              // cache the imm_data as the mask
+            //  ncclIbRecvComm* comm = (ncclIbRecvComm*)req->ibComm;
+            //  comm->txAvailable = wc->imm_data;
+            }
+          }
+          req->events--;
+          INFO (NCCL_INIT|NCCL_NET, "req->type %d req->events %d", req->type, req->events);
+        }
+    }
+  } // while 1
+}
+
+ncclResult_t ncclIbCloseSend(void* sendComm) {
    struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
    if (comm) {
      NCCLCHECK(ncclSocketClose(&comm->sock));
