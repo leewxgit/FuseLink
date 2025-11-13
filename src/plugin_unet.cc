@@ -918,6 +918,110 @@
   uint32_t mirror_qpn[NCCL_UNET_MAX_QPS_PER_COMM];
  };
 
+ // 单个结构体的打印函数
+char* print_single_info(const side_mirror_qp_info* info, char* buffer, size_t buffer_size) {
+    if (!info || !buffer || buffer_size == 0) return nullptr;
+    
+    char* pos = buffer;
+    size_t remaining = buffer_size;
+    
+    // side_ip 和 mirror_ip
+    int written = snprintf(pos, remaining, "side_ip: %s, mirror_ip: %s", 
+                          info->side_ip, info->mirror_ip);
+    if (written > 0) {
+        pos += written;
+        remaining -= written;
+    }
+    
+    // side_qpn 数组
+    written = snprintf(pos, remaining, ", side_qpn: [");
+    if (written > 0) {
+        pos += written;
+        remaining -= written;
+    }
+    
+    for (int i = 0; i < NCCL_IB_MAX_QPS && remaining > 0; i++) {
+        written = snprintf(pos, remaining, "%u%s", info->side_qpn[i], 
+                          (i < NCCL_IB_MAX_QPS - 1) ? ", " : "");
+        if (written > 0) {
+            pos += written;
+            remaining -= written;
+        }
+    }
+    
+    written = snprintf(pos, remaining, "]");
+    if (written > 0) {
+        pos += written;
+        remaining -= written;
+    }
+    
+    // mirror_qpn 数组
+    written = snprintf(pos, remaining, ", mirror_qpn: [");
+    if (written > 0) {
+        pos += written;
+        remaining -= written;
+    }
+    
+    for (int i = 0; i < NCCL_IB_MAX_QPS && remaining > 0; i++) {
+        written = snprintf(pos, remaining, "%u%s", info->mirror_qpn[i], 
+                          (i < NCCL_IB_MAX_QPS - 1) ? ", " : "");
+        if (written > 0) {
+            pos += written;
+            remaining -= written;
+        }
+    }
+    
+    snprintf(pos, remaining, "]");
+    return buffer;
+}
+
+// 结构体数组转换为字符串的主函数
+char* print_info_array(side_mirror_qp_info* info_array, int count, char* buffer, size_t buffer_size) {
+    if (!info_array || !buffer || buffer_size == 0 || count <= 0) {
+        return nullptr;
+    }
+    
+    char* pos = buffer;
+    size_t remaining = buffer_size;
+    
+    // 添加数组开头
+    int written = snprintf(pos, remaining, "side_mirror_qp_info array [%d elements]:\n", count);
+    if (written > 0) {
+        pos += written;
+        remaining -= written;
+    }
+    
+    // 遍历每个结构体
+    for (int i = 0; i < count && remaining > 0; i++) {
+        written = snprintf(pos, remaining, "[%d] ", i);
+        if (written > 0) {
+            pos += written;
+            remaining -= written;
+        }
+        
+        // 打印单个结构体
+        char temp_buffer[512];
+        print_single_info(&info_array[i], temp_buffer, sizeof(temp_buffer));
+        
+        written = snprintf(pos, remaining, "%s", temp_buffer);
+        if (written > 0) {
+            pos += written;
+            remaining -= written;
+        }
+        
+        // 添加换行（除了最后一个）
+        if (i < count - 1 && remaining > 2) {
+            written = snprintf(pos, remaining, "\n");
+            if (written > 0) {
+                pos += written;
+                remaining -= written;
+            }
+        }
+    }
+    
+    return buffer;
+}
+
  ncclResult_t ncclIbAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle_t** /*recvDevComm*/) {
   struct ncclIbListenComm* lComm = (struct ncclIbListenComm*)listenComm;
   struct ncclIbCommStage* stage = &lComm->stage;
@@ -977,8 +1081,10 @@
         side_mirror_qp_info[i].mirror_qpn[q] = mirror_comm->qps[q]->qp_num;
       }
     }
-    if (send(unet_conn_manager->switch_sock_fd_, side_mirror_qp_info, sizeof(struct side_mirror_qp_info) * n_side_comms, 0) < 0) {
-      WARN("NET/Unet: Failed to send side and mirror qp infos to switch");
+    char buffer[4096];
+    print_info_array(side_mirror_qp_info, n_side_comms, buffer, sizeof(buffer));
+    if (send(unet_conn_manager->switch_sock_fd_, buffer, strlen(buffer), 0) < 0) {
+      INFO(NCCL_INIT|NCCL_NET, "NET/Unet: Failed to send side and mirror qp infos to switch");
       delete[] side_mirror_qp_info;
       return ncclInternalError;
     }

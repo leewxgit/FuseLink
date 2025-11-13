@@ -8,6 +8,10 @@
 
 #include "nccl_net.h" // interaction with nccl net plugin
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 extern ncclNet_t ncclNetPlugin_v7;
 
 #define MAX_GPU_NUM 8
@@ -67,14 +71,10 @@ public:
     priority_dev_ = priority_dev;
     memset(&switch_addr_, 0, sizeof(switch_addr_));
     switch_addr_.sin_family = AF_INET;
-    switch_addr_.sin_port = htons(12345);
-    switch_addr_.sin_addr.s_addr = inet_addr("192.168.1.100"); // UNET: need to change to the switch ip address
+    switch_addr_.sin_port = htons(6657);
+    switch_addr_.sin_addr.s_addr = inet_addr("192.168.1.66"); // change to the switch ip address
     //create client socket
     switch_sock_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (switch_sock_fd_ < 0) {
-      INFO(NCCL_INIT|NCCL_NET, "NET/Unet: Failed to create switch socket");
-      return ncclInternalError;
-    }
   }
   int GetNdevs() {
     return ndevs_;
